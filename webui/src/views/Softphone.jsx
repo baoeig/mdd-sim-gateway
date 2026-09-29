@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { api } from '../api.js'
-import { Softphone as Phone } from '../softphone.js'
+import { Softphone as Phone, audioInputPresence, microphoneMessage, MEDIA_FAIL_CAUSE, RELAY_UNAVAILABLE, RELAY_UNREACHABLE } from '../softphone.js'
 import SimSelector from './SimSelector.jsx'
 import { useI18n } from '../i18n.jsx'
+import { useContactNames } from '../contactNames.js'
 
 const GREEN = '#22c55e', RED = '#ef4444'
 const KEYS = [['1', ''], ['2', 'ABC'], ['3', 'DEF'], ['4', 'GHI'], ['5', 'JKL'],
@@ -75,7 +76,7 @@ const WEBRTC_AVAILABLE = typeof RTCPeerConnection === 'function'
 
 // SIP registration states reported by the JsSIP wrapper.
 const REG_LABEL = {
-  idle: 'Idle', connecting: 'Connecting', registered: 'Registered',
+  loading: 'Loading…', idle: 'Idle', connecting: 'Connecting', registered: 'Registered',
   unregistered: 'Unregistered', disconnected: 'Disconnected', failed: 'Registration failed',
 }
 
@@ -110,11 +111,12 @@ function Avatar({ label, color = 'var(--primary)', size = 96 }) {
   )
 }
 
-function RoundBtn({ icon, label, color, bg, onClick, active }) {
+function RoundBtn({ icon, label, color, bg, onClick, active, disabled = false }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
-      <button onClick={onClick} style={{
-        width: 58, height: 58, borderRadius: '50%', cursor: 'pointer', fontSize: 22,
+      <button onClick={disabled ? undefined : onClick} disabled={disabled} style={{
+        width: 58, height: 58, borderRadius: '50%', cursor: disabled ? 'not-allowed' : 'pointer', fontSize: 22,
+        opacity: disabled ? 0.45 : 1,
         border: '1px solid ' + (active ? color : 'var(--border-strong)'),
         background: bg || (active ? color + '22' : 'var(--hover)'),
         color: active ? color : 'var(--text-soft)', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -124,11 +126,19 @@ function RoundBtn({ icon, label, color, bg, onClick, active }) {
   )
 }
 
-export default function Softphone({ selected, subscribe, instances, cards, devices, setSelected, showToast }) {
+// Shown for the whole length of a call that went out on a silent track. The user can hear the
+// call perfectly, so nothing on screen would otherwise suggest they are not being heard.
+function ListenOnlyNote({ t }) {
+  return <div style={{ fontSize: 12, color: '#f59e0b', marginTop: 5 }}>
+    {t('Listen only · the other side cannot hear you')}
+  </div>
+}
+
+export default function Softphone({ selected, subscribe, instances, cards, devices, setSelected, showToast, initialLoading, loadErrors }) {
   const { t } = useI18n()
   const id = selected?.id
   const [prov, setProv] = useState(null)
-  const [reg, setReg] = useState('idle')
+  const [reg, setReg] = useState('loading')
   const [call, setCall] = useState(null)     // {dir, number, state, startedAt, endCause}
   const [callTransport, setCallTransport] = useState('vowifi')
   const [cellularBusy, setCellularBusy] = useState(false)
@@ -138,14 +148,38 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   const [keypad, setKeypad] = useState(false)
   const [dtmfSeq, setDtmfSeq] = useState('')   // digits/symbols entered since the keypad opened
   const [recording, setRecording] = useState(false)
+  // 'present' | 'none' | 'insecure' | 'unknown'. Starts optimistic so the notice can only
+  // ever appear once the probe has actually answered.
+  const [micPresence, setMicPresence] = useState('present')
+  // Set when THIS call went out on a silent track. Kept per call rather than derived from
+  // micPresence: a call placed before the headset was unplugged is still a normal call, and
+  // one placed after it must keep saying so until it ends.
+  const [listenOnly, setListenOnly] = useState(null)
   const [calls, setCalls] = useState([])
+  // The whole visible log in one request; see contactNames.js for why the browser cannot match
+  // a number against the address book itself.
+  const callerNames = useContactNames(calls.map((entry) => entry.peer), id)
+  // The call on this page's own line: it rings here, not in the global overlay, so the name has
+  // to be looked up here too.
+  const callName = useContactNames(call?.number ? [call.number] : [], id)[call?.number] || ''
+  // The name when the book has one, with the number beneath it; the number alone otherwise.
+  const callParty = (size, fallback = '') => callName
+    ? <>
+        <div style={{ fontSize: size, fontWeight: 700 }}>{callName}</div>
+        <div className="mono" style={{ fontSize: 13, color: 'var(--text-mute)' }}>{call.number}</div>
+      </>
+    : <div className="mono" style={{ fontSize: size, fontWeight: 700 }}>{call.number || fallback}</div>
   const [callSelMode, setCallSelMode] = useState(false)
   const [callSel, setCallSel] = useState(() => new Set())
   // Keyed by voicemail id. The <audio> is only created once the user asks to play, so a log
   // full of messages does not open a fetch per row.
   const [voicemails, setVoicemails] = useState({})
+  const [historyLoading, setHistoryLoading] = useState(false)
   const [vmOpen, setVmOpen] = useState(null)
   const phone = useRef(null)
+  // JsSIP can emit `unregistered` while a freshly-created UA is still opening its websocket.
+  // That is an initial condition, not evidence that a working registration was lost.
+  const registeredOnce = useRef(false)
   // Persistent, DOM-rendered <audio> sink. One stable element (primed on the first click via
   // unlockAudio) is what makes remote WebRTC audio play under Chrome/Edge autoplay policy.
   const audioRef = useRef(null)
@@ -166,10 +200,12 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   // return out of order: an older one landing last would put a stale list back on screen and
   // the verdict would flip back to "waiting". Only the newest request may write.
   const loadSeq = useRef(0)
-  const loadCalls = useCallback(() => {
+  const loadCalls = useCallback((showLoading = false) => {
     if (!id) return
     const seq = ++loadSeq.current
+    if (showLoading) setHistoryLoading(true)
     api.calls(id).then((r) => { if (seq === loadSeq.current) setCalls(r.calls || []) }).catch(() => {})
+      .finally(() => { if (seq === loadSeq.current) setHistoryLoading(false) })
   }, [id])
   const markHeard = (vid) => {
     if (voicemails[vid]?.listened) return
@@ -190,7 +226,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       .then((r) => setVoicemails(Object.fromEntries((r.voicemails || []).map((v) => [v.id, v]))))
       .catch(() => {})
   }, [id])
-  useEffect(() => { loadCalls(); loadVoicemails() }, [loadCalls, loadVoicemails])
+  useEffect(() => { loadCalls(true); loadVoicemails() }, [loadCalls, loadVoicemails])
   useEffect(() => { setCallSelMode(false); setCallSel(new Set()); setCallTransport('vowifi') }, [id])
   useEffect(() => {
     if (!cellularReady && callTransport === 'cellular') setCallTransport('vowifi')
@@ -265,8 +301,13 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   useEffect(() => {
     if (!id) return
     let alive = true
-    setReg('idle'); setCall(null)
-    api.softphone(id).then((p) => { if (alive) setProv(p) }).catch(() => {})
+    registeredOnce.current = false
+    setProv(null); setReg('loading'); setCall(null)
+    api.softphone(id).then((p) => {
+      if (!alive) return
+      setProv(p)
+      if (!p?.enabled) setReg('idle')
+    }).catch(() => { if (alive) setReg('failed') })
     return () => { alive = false; if (phone.current) { phone.current.stop(); phone.current = null } }
   }, [id])
 
@@ -275,6 +316,8 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
     setKeypad(false); setMuted(false); setRecording(false)
     loadCalls()
   }
+  // The listen-only notice belongs to one call; drop it once the screen goes back to idle.
+  useEffect(() => { if (!call) setListenOnly(null) }, [call])
   // How long the 'ended' screen stays up. A service code's answer is NOT carried by the call:
   // it rides an in-dialog request, is parsed by the manager and arrives over the websocket
   // after the call is already torn down. Clearing on the ordinary 2.5s would hide the very
@@ -324,11 +367,16 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   const connect = useCallback(() => {
     if (!prov || !prov.enabled || phone.current) return
     const ph = new Phone((type, data) => {
-      if (type === 'registered') setReg(data ? 'registered' : 'unregistered')
+      if (type === 'registered' && data) {
+        registeredOnce.current = true
+        setReg('registered')
+      } else if (type === 'registered') {
+        setReg(registeredOnce.current ? 'unregistered' : 'connecting')
+      }
       else if (type === 'ws') setReg((r) => data === 'connected' ? (r === 'registered' ? r : 'connecting') : 'disconnected')
       else if (type === 'regfail') setReg('failed')
       else if (type === 'incoming') setCall({ dir: 'in', number: data.from || 'Unknown', state: 'incoming', transport: 'vowifi' })
-      else if (type === 'calling') setCall({ dir: 'out', number: data.to, state: 'calling', transport: 'vowifi', serviceCode: isServiceCode(data.to) })
+      else if (type === 'calling') { setListenOnly(null); setCall({ dir: 'out', number: data.to, state: 'calling', transport: 'vowifi', serviceCode: isServiceCode(data.to) }) }
       // 'progress' fires for BOTH directions. On an incoming call JsSIP auto-sends 180 and
       // emits progress('local'); mapping that to 'ringing' would blow away the 'incoming'
       // state and hide the Answer/Decline overlay. Only an OUTGOING call still in the
@@ -337,8 +385,17 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       else if (type === 'active') setCall((c) => c ? { ...c, state: 'active', startedAt: Date.now() } : c)
       else if (type === 'ended') clearCallSoon(data && data.cause)
       else if (type === 'failed') clearCallSoon(data && data.cause)
-    }, audioRef.current)
-    ph.start(prov, prov.host || location.hostname)
+      // The call is going out on silence: the carrier is audible, the user is not. Say it
+      // once here and keep saying it on the call screen for as long as the call lasts.
+      else if (type === 'mediafallback') { setListenOnly(data); toast(t(microphoneMessage(data))) }
+      // Last resort: the browser could not even produce a silent track, so JsSIP asked for
+      // the microphone itself and the call really did die. 'failed' has already reset the
+      // screen by now; this is what tells the user why.
+      else if (type === 'mediafail') toast(t(microphoneMessage(data)))
+      else if (type === 'relayunavailable') toast(t(RELAY_UNAVAILABLE))
+      else if (type === 'relayunreachable') toast(t(RELAY_UNREACHABLE))
+    }, audioRef.current, () => api.softphone(id))
+    if (!ph.start(prov, prov.host || location.hostname)) return
     phone.current = ph
     setReg('connecting')
   }, [prov])
@@ -348,6 +405,18 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   // The <audio> element mounts with the component; make sure the phone (which may have been
   // created before the ref attached) points at it.
   useEffect(() => { if (phone.current && audioRef.current) phone.current.setAudioEl(audioRef.current) })
+
+  // Probe for a microphone once, and again whenever the set of devices changes (a headset
+  // plugged in should clear the warning without a reload). enumerateDevices() prompts for
+  // nothing and opens nothing, so this is free to run on mount.
+  useEffect(() => {
+    let alive = true
+    const probe = () => { audioInputPresence().then((p) => { if (alive) setMicPresence(p) }).catch(() => {}) }
+    probe()
+    const media = navigator.mediaDevices
+    media?.addEventListener?.('devicechange', probe)
+    return () => { alive = false; media?.removeEventListener?.('devicechange', probe) }
+  }, [])
 
   // in-call duration timer
   useEffect(() => {
@@ -444,6 +513,16 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       toast(t('This browser has WebRTC disabled, so no call can be placed. A privacy or ad-blocking extension is the usual cause — allow WebRTC for this site, or open it in a private window.'))
       return
     }
+    // The status dot already says the line is down, but the Call button did not read it: the
+    // INVITE went into a websocket that is not there and the screen reported an ordinary
+    // failed call. 'connecting' is deliberately allowed through — the transport may come up
+    // within the call setup — while these three states cannot carry a call at all.
+    if (callTransport === 'vowifi' && ['disconnected', 'failed', 'unregistered'].includes(reg)) {
+      toast(t(reg === 'disconnected'
+        ? 'This browser is not connected to the line’s engine, so the call cannot be placed. Check that the engine for this SIM is running.'
+        : 'This line is not registered right now, so the call cannot be placed. Wait for the Registered indicator, or check the line’s VoWiFi status.'))
+      return
+    }
     if (callTransport === 'cellular') {
       // The cellular backend places a voice call. A service code is supplementary-service
       // signalling, which needs AT+CUSD instead, so fail loudly rather than dialling nonsense.
@@ -470,7 +549,13 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       return
     }
     if (!phone.current) return
-    phone.current.unlockAudio(); phone.current.call(target); setNum('')
+    // Must stay synchronous inside the click: it is the transient user activation that makes
+    // remote audio playable later.
+    phone.current.unlockAudio()
+    // A missing microphone does NOT stop the call — it goes out on a silent track and the
+    // phone reports 'mediafallback', which is what puts the listen-only notice on screen.
+    phone.current.call(target)
+    setNum('')
   }
   const answer = () => { phone.current?.unlockAudio(); phone.current?.answer() }
   // Optimistically move to 'ended' on a local hangup. JsSIP will still fire 'ended'
@@ -515,6 +600,8 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
     } else { const ok = await phone.current.startRecording(); setRecording(ok) }
   }
 
+  if (initialLoading && !id) return <p role="status">{t('Loading')}…</p>
+  if (loadErrors?.instances && !id) return <p className="u-error">{t('Loading failed')}</p>
   if (!id) return (
     <div>
       <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} />
@@ -526,7 +613,11 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   const inCall = call && (call.state === 'active' || call.state === 'calling' || call.state === 'ringing' || call.state === 'incoming' || call.state === 'ended')
   const endLabel = (c, isCode) => (isCode
     ? t(SERVICE_CODE_END_LABEL[c] || 'The carrier gave no usable answer to this code.')
-    : t(c === 'Rejected' ? 'Call declined' : c === 'Busy' ? 'Busy' : c === 'Canceled' || c === 'Canceled/Rejected' ? 'Call cancelled' : 'Call ended'))
+    // A local media failure never reached the carrier, so reporting it as a plain "Call
+    // ended" describes the one thing that did NOT happen. Name it: the toast explains what
+    // to do about it, and this line stops the screen from blaming the call.
+    : t(c === MEDIA_FAIL_CAUSE ? 'Microphone unavailable'
+      : c === 'Rejected' ? 'Call declined' : c === 'Busy' ? 'Busy' : c === 'Canceled' || c === 'Canceled/Rejected' ? 'Call cancelled' : 'Call ended'))
 
   // Google-Voice-style incoming-call overlay (prominent, full-panel)
   const IncomingOverlay = call?.state === 'incoming' ? (
@@ -536,7 +627,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
         boxShadow: '0 20px 60px rgba(0,0,0,.6)', animation: 'none' }}>
         <div style={{ fontSize: 13, color: 'var(--text-mute)', letterSpacing: 1, textTransform: 'uppercase' }}>{t('Incoming call')}</div>
         <div style={{ margin: '22px 0' }}><Avatar label={call.number} color={GREEN} size={110} /></div>
-        <div className="mono" style={{ fontSize: 26, fontWeight: 800 }}>{call.number || 'Unknown'}</div>
+        {callParty(26, 'Unknown')}
         <div style={{ fontSize: 13, color: 'var(--text-mute)', marginTop: 6 }}>{selected?.name || 'VoWiFi line'}</div>
         <div style={{ display: 'flex', justifyContent: 'center', gap: 56, marginTop: 34 }}>
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
@@ -598,7 +689,13 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
             {t('This browser has WebRTC disabled, so no call can be placed. A privacy or ad-blocking extension is the usual cause — allow WebRTC for this site, or open it in a private window.')}
           </div>
         )}
-        {callTransport === 'vowifi' && !prov?.enabled && (
+        {callTransport === 'vowifi' && (micPresence === 'none' || micPresence === 'insecure') && (
+          <div style={{ margin: '12px 0', padding: '10px 12px', borderRadius: 8, fontSize: 13,
+            lineHeight: 1.5, color: '#b45309', background: '#fffbeb', border: '1px solid #fcd34d' }}>
+            {t(microphoneMessage(micPresence))}
+          </div>
+        )}
+        {callTransport === 'vowifi' && prov && !prov.enabled && (
           <div style={{ color: '#f97316', fontSize: 13, margin: '12px 0' }}>
             {t('WebRTC is disabled for this SIM. Enable it in SIM Config (needs HTTPS/TLS) to use the browser phone.')}
           </div>
@@ -614,10 +711,11 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', textAlign: 'center', gap: 16 }}>
             <Avatar label={call.number} />
             <div>
-              <div className="mono" style={{ fontSize: 22, fontWeight: 700 }}>{call.number}</div>
+              {callParty(22)}
               <div style={{ fontSize: 13, color: 'var(--text-mute)', marginTop: 4 }}>{call.serviceCode
                 ? t('Sending the code to the carrier…')
                 : (call.state === 'ringing' ? t('Ringing…') : t('Calling…'))}</div>
+              {listenOnly && !call.serviceCode && <ListenOnlyNote t={t} />}
             </div>
             <div style={{ display: 'flex', justifyContent: 'center', marginTop: 10 }}>
               <RoundBtn icon="✕" label={t('End')} color="#fff" bg={RED} onClick={hangup} />
@@ -630,11 +728,12 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', textAlign: 'center', gap: 14 }}>
             <Avatar label={call.number} color={GREEN} size={84} />
             <div>
-              <div className="mono" style={{ fontSize: 20, fontWeight: 700 }}>{call.number || 'Unknown'}</div>
+              {callParty(20, 'Unknown')}
               {call.serviceCode
                 ? <div style={{ fontSize: 13, color: GREEN, marginTop: 4 }}>{call.ussdText || t('Carrier accepted the code. Waiting for its reply…')}</div>
                 : <div style={{ fontSize: 15, color: GREEN, marginTop: 4, fontVariantNumeric: 'tabular-nums' }}>{fmtDur(dur)}</div>}
               {call.transport === 'cellular' && <div style={{ fontSize: 12, color: '#f59e0b', marginTop: 5 }}>{t('Cellular call connected · browser audio unavailable')}</div>}
+              {listenOnly && call.transport !== 'cellular' && !call.serviceCode && <ListenOnlyNote t={t} />}
               {recording && <div style={{ fontSize: 12, color: RED, marginTop: 2 }}>● Recording</div>}
             </div>
             {call.transport !== 'cellular' && !call.serviceCode && keypad && (
@@ -658,7 +757,8 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
                 signalling that the carrier answers and tears down in about a second. Offering
                 them implies an audio call that is not happening — only Hang up is real here. */}
             {call.transport !== 'cellular' && !call.serviceCode && <div style={{ display: 'flex', justifyContent: 'center', gap: 22, marginTop: 8 }}>
-              <RoundBtn icon={muted ? '🔇' : '🎙'} label={t(muted ? 'Unmute' : 'Mute')} color="#60a5fa" onClick={toggleMute} active={muted} />
+              <RoundBtn icon={listenOnly ? '🚫' : muted ? '🔇' : '🎙'} label={t(listenOnly ? 'No mic' : muted ? 'Unmute' : 'Mute')}
+                color="#60a5fa" onClick={toggleMute} active={muted} disabled={Boolean(listenOnly)} />
               <RoundBtn icon="⌨" label={t('Keypad')} color="#a78bfa" onClick={() => setKeypad((v) => !v)} active={keypad} />
               <RoundBtn icon="⏺" label={t(recording ? 'Stop' : 'Record')} color={RED} onClick={toggleRecord} active={recording} />
             </div>}
@@ -672,7 +772,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
         {call?.state === 'ended' && (
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', textAlign: 'center', gap: 12 }}>
             <Avatar label={call.number} color={call.endCause === 'Rejected' ? RED : 'var(--text-mute)'} />
-            <div className="mono" style={{ fontSize: 20, fontWeight: 700 }}>{call.number || 'Unknown'}</div>
+            <div>{callParty(20, 'Unknown')}</div>
             {call.ussdText && (
               <div style={{ maxWidth: 320, margin: '0 auto', padding: '12px 14px', borderRadius: 10,
                 background: 'var(--input-bg)', border: '1px solid var(--border-strong)',
@@ -788,7 +888,8 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
           )}
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minHeight: 0, overflow: 'auto' }}>
-          {calls.length === 0 && <div style={{ fontSize: 13, color: 'var(--text-mute)' }}>{t('No calls yet.')}</div>}
+          {historyLoading && calls.length === 0 && <div role="status" style={{ fontSize: 13, color: 'var(--text-mute)' }}>{t('Loading')}…</div>}
+          {!historyLoading && calls.length === 0 && <div style={{ fontSize: 13, color: 'var(--text-mute)' }}>{t('No calls yet.')}</div>}
           {calls.map((c) => {
             const s = (c.status || '').toLowerCase()
             const color = s === 'answered' ? GREEN : (s === 'rejected' || s === 'busy' || s === 'failed') ? RED
@@ -805,7 +906,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
                   background: checked ? 'var(--active)' : 'var(--input-bg)' }}>
                 {callSelMode && <input type="checkbox" readOnly checked={checked} style={{ width: 'auto', flexShrink: 0 }} />}
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div className="mono" style={{ fontWeight: 600 }}>{c.peer}</div>
+                  <div className={callerNames[c.peer] ? '' : 'mono'} style={{ fontWeight: 600 }}>{callerNames[c.peer] || c.peer}</div>
                   <div style={{ fontSize: 11, color: 'var(--text-mute)' }}>{dlabel} · {new Date(c.start_ts * 1000).toLocaleString()}{c.transport === 'cellular' ? ` · ${t('Cellular modem')}` : ''}</div>
                   {c.ussd_text && (
                     <div title={c.ussd_text} style={{ fontSize: 11.5, marginTop: 3, color: 'var(--text-soft)',

@@ -19,6 +19,8 @@ import requests
 import hashlib
 import ipaddress
 
+from outer_transport import proxy_udp_socket
+
 # Python 3.14 changed POSIX multiprocessing's default from fork to forkserver.  The SWu data
 # plane workers intentionally inherit the live IKE/crypto state; serialising that state is both
 # unnecessary and impossible (cryptography's DHParameterNumbers is not picklable).  Keep the
@@ -153,6 +155,7 @@ SWU_IFACE = os.environ.get("SWU_IFACE", "ipsec0")          # tun device name (pj
 SWU_NOTIFY = os.environ.get("SWU_NOTIFY", "/usr/local/bin/notify.py")
 SWU_ASSIGN_IPV6_GLOBAL = os.environ.get("SWU_ASSIGN_IPV6_GLOBAL", "1") not in ("0", "", "no")
 SWU_WRITE_RESOLV = os.environ.get("SWU_WRITE_RESOLV", "0") not in ("0", "", "no")
+SWU_EGRESS_PROXY = os.environ.get("SWU_EGRESS_PROXY", "").strip()
 
 # --- Data-plane MTU / fragmentation handling -------------------------------------------------
 # The userspace ESP dataplane reads inner IP packets off the tun (ipsec0), wraps each in
@@ -239,12 +242,74 @@ def swu_notify(event, arg=None):
         pass
 
 
-def swu_apply_pcscf(addr):
-    """Re-render pjsip.conf for a (possibly new) P-CSCF and reload Asterisk, but only when the
-    P-CSCF actually changed. The ePDG can hand out a DIFFERENT P-CSCF on every (re)connect /
-    reauth; pjsip's type=identify/type=resolve are pinned to the P-CSCF IP, so a stale value
-    means inbound INVITEs from the new P-CSCF don't match (calls/SMS fail) and outbound routing
-    is wrong. This keeps them in sync on every reconnect, not just the first bring-up."""
+def _asterisk_cli(command):
+    """Run one Asterisk CLI command, best effort."""
+    try:
+        subprocess.call(["asterisk", "-rx", command],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _pcscf_debug_window(seconds):
+    """Raise Asterisk's debug level for a bounded window around a P-CSCF apply.
+
+    Asterisk has been leaving the container within ~10-20s of the reload that follows a tunnel
+    re-establish, through a path that leaves neither a shutdown log line nor a kernel crash
+    record. At the shipped verbosity nothing at all is logged in that gap. This switches debug
+    on just for the apply, so the next occurrence is recorded, and schedules it back off so the
+    steady state is unchanged.
+    """
+    if seconds <= 0:
+        return
+    _asterisk_cli("core set debug 3")
+
+    def _off():
+        time.sleep(seconds)
+        _asterisk_cli("core set debug 0")
+
+    try:
+        threading.Thread(target=_off, daemon=True).start()
+    except Exception:
+        _asterisk_cli("core set debug 0")
+
+
+def _asterisk_running():
+    """True when an Asterisk accepts remote-console commands in this container."""
+    try:
+        return subprocess.call(["asterisk", "-rx", "core show uptime"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    except Exception:
+        return False
+
+
+def swu_apply_pcscf(addr, tunnel_rebuilt=False):
+    """Re-render pjsip.conf for a (possibly new) P-CSCF and make Asterisk pick it up, but only
+    when the P-CSCF actually changed. The ePDG can hand out a DIFFERENT P-CSCF on every
+    (re)connect / reauth; pjsip's type=identify/type=resolve are pinned to the P-CSCF IP, so a
+    stale value means inbound INVITEs from the new P-CSCF don't match (calls/SMS fail) and
+    outbound routing is wrong. This keeps them in sync on every reconnect, not just the first
+    bring-up.
+
+    How the new value is applied is selectable via SWU_PCSCF_APPLY_MODE:
+
+      restart (default) - `core restart now`, an Asterisk-internal cold restart.
+      reload            - `module reload res_pjsip.so`, the previous behaviour.
+
+    `reload` crashes Asterisk. Core dumps from two lines on two carriers show the same stack:
+    after the reload, the first REGISTER challenged with 401 hands a freed auth credential to
+    pjsip_auth_clt_set_credentials(), and pj_strdup's memcpy faults on it. It does not fire on
+    every reload, but when it does Docker rebuilds the whole container (~40s+). A cold restart
+    builds every object fresh, so the stale credential never exists; measured at ~21-24s from
+    the ePDG teardown to re-registration, with the container and tunnel kept.
+
+    tunnel_rebuilt: the caller has just completed a full attach. The new tunnel has a new
+    inner address even when the ePDG hands back the same P-CSCF, and Asterisk's registration
+    still points at the old one. Keyed on the P-CSCF alone, that case did nothing: on
+    09-18 04:09 line 7 reconnected to the same P-CSCF and stayed "Registered" but unreachable
+    for 17.5 minutes, until the dead transport failed on its own. A rebuilt tunnel is applied
+    unconditionally; a P-CSCF change inside a live tunnel (restoration) still keys on the value.
+    """
     if not addr:
         return
     last = None
@@ -253,25 +318,53 @@ def swu_apply_pcscf(addr):
             last = f.read().strip()
     except Exception:
         last = None
-    if last == addr:
+    if last == addr and not tunnel_rebuilt:
         return
     render = os.environ.get("SWU_RENDER", "/usr/local/bin/render.py")
     if not os.path.exists(render):
         return
+    mode = (os.environ.get("SWU_PCSCF_APPLY_MODE") or "restart").strip().lower()
+    if mode not in ("reload", "restart"):
+        swu_log("unknown SWU_PCSCF_APPLY_MODE %r; falling back to restart" % mode)
+        mode = "restart"
     try:
-        swu_log("P-CSCF changed (%s -> %s); re-rendering pjsip + reloading Asterisk" % (last, addr))
+        # On a container's first bring-up the tunnel connects before the entrypoint has written
+        # pcscf.applied, so every fresh start looked like a P-CSCF change. With no Asterisk yet
+        # there is nothing to apply to: the config written here is what it will start with.
+        # Under `restart` the old behaviour could otherwise cold-restart an Asterisk that had
+        # only just come up.
+        if not _asterisk_running():
+            subprocess.call(["python3", render],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with open(os.path.join(SWU_RUNDIR, "pcscf.applied"), "w") as f:
+                f.write(addr)
+            swu_log("P-CSCF %s rendered; Asterisk not running yet, nothing to apply" % addr)
+            return
+        if last == addr:
+            swu_log("tunnel re-established with the same P-CSCF %s; the inner address changed, "
+                    "re-applying via %s so Asterisk re-registers from it" % (addr, mode))
+        else:
+            swu_log("P-CSCF changed (%s -> %s); re-rendering pjsip + applying via %s"
+                    % (last, addr, mode))
+        swu_notify("pcscf_apply_start", mode)
+        _pcscf_debug_window(int(os.environ.get("SWU_PCSCF_DEBUG_SECONDS", "90") or 0))
         subprocess.call(["python3", render], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # Reload just the parts affected by the P-CSCF change. res_pjsip reload re-reads
-        # pjsip.conf (identify/resolve/registration/endpoint) without dropping the tunnel.
-        subprocess.call(["asterisk", "-rx", "module reload res_pjsip.so"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.call(["asterisk", "-rx", "pjsip send register volte_ims"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Write the applied-marker BEFORE touching Asterisk. Under `restart` the config is
+        # already on disk and a cold start picks it up, so a restart that never returns must not
+        # leave the marker stale and re-trigger this on the next discovery.
         with open(os.path.join(SWU_RUNDIR, "pcscf.applied"), "w") as f:
             f.write(addr)
+        if mode == "restart":
+            # Asterisk re-execs itself; the container, this process and the tunnel all survive.
+            # Any call in progress is dropped — acceptable here because the tunnel carrying it
+            # has just been torn down anyway.
+            _asterisk_cli("core restart now")
+        else:
+            _asterisk_cli("module reload res_pjsip.so")
+            _asterisk_cli("pjsip send register volte_ims")
+        swu_notify("pcscf_apply_done", mode)
     except Exception as e:
         swu_log("pcscf apply failed: %r" % e)
-
 
 '''
 
@@ -430,6 +523,76 @@ TV =  1
 
 #IKEv2 Transform Attribute Types
 KEY_LENGTH = (14, TV)
+
+
+def ike_proposals_for_plmn(mcc, mnc):
+    """Return IKE proposals for the home PLMN.
+
+    DITO Telecommunity's ePDG (515-66) advertises only the legacy 3GPP suite
+    AES-CBC-128 / HMAC-SHA1 / MODP-1024.  Keep the stronger, proven upstream
+    proposal set for every other carrier instead of weakening negotiation globally.
+    """
+    plmn = (str(mcc or "").zfill(3), str(mnc or "").zfill(3))
+    if plmn == ("515", "066"):
+        return [[
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 128]],
+            [PRF, PRF_HMAC_SHA1],
+            [INTEG, AUTH_HMAC_SHA1_96],
+            [D_H, MODP_1024_bit],
+        ]]
+    return [
+        [
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 256]],
+            [PRF, PRF_HMAC_SHA2_256],
+            [INTEG, AUTH_HMAC_SHA2_256_128],
+            [D_H, MODP_2048_bit],
+        ],
+        [
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 128]],
+            [PRF, PRF_HMAC_SHA2_256],
+            [INTEG, AUTH_HMAC_SHA2_256_128],
+            [D_H, MODP_2048_bit],
+        ],
+        [
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 256]],
+            [PRF, PRF_HMAC_SHA1],
+            [INTEG, AUTH_HMAC_SHA1_96],
+            [D_H, MODP_2048_bit],
+        ],
+        [
+            [IKE, 0],
+            [ENCR, ENCR_AES_CBC, [KEY_LENGTH, 128]],
+            [PRF, PRF_HMAC_SHA1],
+            [INTEG, AUTH_HMAC_SHA1_96],
+            [D_H, MODP_2048_bit],
+        ],
+    ]
+
+
+def requests_permanent_eap_identity(attributes):
+    """Whether EAP-AKA asks the UE for a permanent/full-auth identity."""
+    if not attributes:
+        return False
+    return attributes[0][0] in (
+        AT_PERMANENT_ID_REQ,
+        AT_ANY_ID_REQ,
+        AT_FULLAUTH_ID_REQ,
+        AT_IDENTITY,
+    )
+
+
+def build_eap_identity_response(identifier, identity):
+    """EAP-Response/Identity (RFC 3748 §5.1): the Type-Data is the bare NAI,
+    with none of EAP-AKA's attribute framing."""
+    identity_bytes = identity.encode()
+    return (bytes([EAP_RESPONSE, identifier])
+            + struct.pack('!H', 5 + len(identity_bytes))
+            + bytes([EAP_IDENTITY])
+            + identity_bytes)
 
 
 #states
@@ -746,6 +909,7 @@ EAP_SUCCESS  = 3
 EAP_FAILURE  = 4
 
 #IANA EAP Type
+EAP_IDENTITY = 1
 EAP_AKA = 23
 
 #EAP-AKA/EAP-SIM Subtypes:
@@ -811,6 +975,9 @@ class swu():
         self.imsi = imsi
         
         self.netns_name = netns
+        self.egress_proxy = SWU_EGRESS_PROXY
+        # SOCKS5 UDP carries an IPv4 destination as RSV/FRAG/ATYP/DST.ADDR/DST.PORT.
+        self.proxy_udp_overhead = 10 if self.egress_proxy else 0
         
         self.set_variables()
         self.set_udp() # default
@@ -903,10 +1070,15 @@ class swu():
         # shared response handler credits an error notify against the right rekey driver.
         self._create_child_kind = None
 
-        # Proactive IKE SA rekey (RFC 7296 2.18, UE-initiated make-before-break). Some ePDGs
-        # (EE) rekey the IKE SA themselves at a fixed age (~12 h observed); we do not implement
-        # the responder side of that (state_epdg_create_sa refuses it and the ePDG then deletes
-        # the SA => ~1 min outage). Rekeying FIRST keeps us the exchange initiator, so the SA
+        # Proactive IKE SA rekey (RFC 7296 2.18, UE-initiated make-before-break). Carriers
+        # bound the IKE SA / SWu session by a local clock we cannot see: EE rekeys it at
+        # ~12 h, and giffgaff/O2 UK silently invalidates the session at ~2h50m without any
+        # IKE message at all (issue #33) — IMS then rejects re-REGISTER until a fresh
+        # session exists. We do not implement the responder side of an ePDG-initiated rekey
+        # (state_epdg_create_sa refuses it and the ePDG then deletes the SA => ~1 min
+        # outage), so this period must stay comfortably below the carrier's clock; render.py
+        # supplies it from settings (default 150 min). Rekeying FIRST keeps us the exchange
+        # initiator, so the SA
         # roles, key-selection and header-flag assumptions baked into this file stay valid. The
         # machinery (state_ue_create_sa + the IKE branch of state_epdg_create_sa_response:
         # SKEYSEED' = prf(SK_d, g^ir | Ni | Nr), old-SA answer paths, DELETE old) predates this
@@ -1186,13 +1358,19 @@ class swu():
         self.socket_type = UDP
 
     def create_socket(self,client_address):
-        
+
         if self.socket_type == UDP:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if self.egress_proxy:
+                self.socket = proxy_udp_socket(
+                    self.egress_proxy, self.server_address,
+                    source=client_address, timeout=self.timeout)
+            else:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         else:
             exit()
-            
-        self.socket.bind(client_address)                
+
+        if not self.egress_proxy:
+            self.socket.bind(client_address)
         self.socket.settimeout(self.timeout)
         self._enable_outer_pmtud(self.socket)
 
@@ -1200,17 +1378,29 @@ class swu():
     def create_socket_nat(self,client_address):
         
         if self.socket_type == UDP:
-            self.socket_nat = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if self.egress_proxy:
+                self.socket_nat = proxy_udp_socket(
+                    self.egress_proxy, self.server_address_nat,
+                    source=client_address, timeout=self.timeout)
+            else:
+                self.socket_nat = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         else:
             exit()
-            
-        self.socket_nat.bind(client_address)                
+
+        if not self.egress_proxy:
+            self.socket_nat.bind(client_address)
         self.socket_nat.settimeout(self.timeout)
         self._enable_outer_pmtud(self.socket_nat)
 
     def create_socket_esp(self,client_address):
-        self.socket_esp = socket.socket(socket.AF_INET, socket.SOCK_RAW, ESP_PROTOCOL)
-        self.socket_esp.bind(client_address)    
+        if self.egress_proxy:
+            # SOCKS5 has no raw-IP transport.  Keep a selectable, unreachable local socket
+            # for the existing worker loop; every real packet is forced to UDP/4500 below.
+            self.socket_esp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket_esp.bind(("127.0.0.1", 0))
+        else:
+            self.socket_esp = socket.socket(socket.AF_INET, socket.SOCK_RAW, ESP_PROTOCOL)
+            self.socket_esp.bind(client_address)
         self._enable_outer_pmtud(self.socket_esp)
 
     def _enable_outer_pmtud(self, sock):
@@ -2309,8 +2499,8 @@ class swu():
 
         Without this, every reply the container sources from its docker-bridge address (SWU_SOURCE,
         e.g. 172.17.0.3) — DNS lookups AND, crucially, the SYN-ACK/return traffic of any published
-        port (the WebRTC WSS softphone on 8089, the manager AMI) — matches a /1 route
-        and is sent into the ePDG, which drops it. Symptom: a LAN client's TCP to the mapped WSS port
+        port or bridge peer (the softphone WS relay, the manager AMI) — matches a /1 route
+        and is sent into the ePDG, which drops it. Symptom: a LAN client's TCP to a mapped port
         never completes its handshake (SYN in on eth0, SYN-ACK out on ipsec0, lost), so the softphone
         can't connect; and container DNS times out (40s).
 
@@ -2454,7 +2644,7 @@ class swu():
 
     def _inner_mtu_from(self, outer_mtu):
         """Largest inner IP packet whose ESP encapsulation fits one outer datagram of outer_mtu."""
-        m = outer_mtu - self._esp_overhead() - SWU_MTU_MARGIN
+        m = outer_mtu - self._esp_overhead() - self.proxy_udp_overhead - SWU_MTU_MARGIN
         return m if m >= 68 else 68
 
     def _compute_and_apply_tun_mtu(self):
@@ -2674,17 +2864,21 @@ class swu():
             self.exec_in_netns("ip addr add " + self.ip_address_list[0] + "/32 dev " + self.tun_device)
             #set host route, only  required if no netns
             if not self.netns_name:
-                if self.default_gateway is None:
-                    self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + self.get_default_gateway_linux()[0])
+                # Behind a country exit the Engine sits on an internal network with no default
+                # route: IKE and ESP reach the ePDG through the SOCKS proxy on that network's own
+                # subnet, which the /1 tunnel routes below never cover, so there is nothing to pin.
+                gateway = self.default_gateway or (self.get_default_gateway_linux() or [None])[0]
+                if gateway:
+                    self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + gateway)
                 else:
-                    self.exec_in_netns("route add " + self.server_address[0] + "/32 gw " + self.default_gateway)
+                    swu_log("no default route (proxied egress): ePDG host route not needed")
 
             # VoWiFi engine addition: on an IPv4 IMS PDN (e.g. Vodafone UK, cp_mode=v4) the two /1
             # routes below make the tunnel the default route for ALL IPv4. That blackholes every
             # packet the container sources from its docker-bridge address (SWU_SOURCE): DNS lookups
             # (-> 40s timeouts, delaying the IMS SMS RP-ACK past its correlation window so the SMSC
             # 488s it and re-pushes the same SM forever) AND the return traffic of any published port
-            # (the WebRTC WSS softphone, AMI) — a LAN client's SYN-ACK goes out ipsec0
+            # (the softphone WS relay, AMI) — a LAN client's SYN-ACK goes out ipsec0
             # and is lost, so the softphone can never connect. Fix both at once with SOURCE-based
             # policy routing: traffic sourced from the container's LAN address goes out the LAN link,
             # while IMS traffic (sourced from the tunnel INNER address) still uses the /1 tunnel
@@ -2791,6 +2985,13 @@ class swu():
         addr_int = int(network.network_address) | (iid & host_mask)
         return (str(ipaddress.IPv6Address(addr_int)), plen)
      
+    def seconds_since_connect(self):
+        """How long the current tunnel has been up, or -1 if it never reached CONNECTED."""
+        started = getattr(self, "_connected_at", None)
+        if not started:
+            return -1
+        return max(0, int(time.time() - started))
+
     def delete_routes(self):
         if self.netns_name:
             subprocess.call("ip netns del %s" % self.netns_name, shell=True)
@@ -2810,8 +3011,10 @@ class swu():
       
 
     def get_default_source_address(self):
-    
-        proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + get_default_gateway_linux()[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
+        gateway = get_default_gateway_linux()
+        if not gateway:
+            return None
+        proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + gateway[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
         output = str(proc.stdout.read())
         if 'addr:' in output:
             addr = output.split('addr:')[1].split()[0]
@@ -2990,7 +3193,7 @@ class swu():
         cur = getattr(self, "inner_mtu", 0) or (SWU_TUN_MTU_ENV or 1400)
         new_inner = None
         if outer:
-            candidate = outer - overhead - SWU_MTU_MARGIN
+            candidate = outer - overhead - self.proxy_udp_overhead - SWU_MTU_MARGIN
             if candidate < cur:
                 new_inner = candidate
         if new_inner is None:
@@ -4154,6 +4357,10 @@ class swu():
                         swu_log("ePDG supports IKEv2 fragmentation (RFC 7383)")
                         
             self.generate_keying_material()
+            if self.egress_proxy:
+                # The relay necessarily changes the outer source address.  Force RFC 3948
+                # encapsulation even if a non-conforming peer omitted NAT detection payloads.
+                self.userplane_mode = NAT_TRAVERSAL
             
             
             return OK,''
@@ -4173,6 +4380,7 @@ class swu():
             return TIMEOUT,'TIMEOUT'
 
         eap_received = False
+        eap_summary = None
         if self.ike_decoded_header['exchange_type'] == IKE_AUTH and self.decoded_payload[0][0] == SK:
             print('received IKE_AUTH (1)')             
             for i in self.decoded_payload[0][1]:
@@ -4200,7 +4408,23 @@ class swu():
                         return OTHER_ERROR,str(code)
 
                 elif i[0] == EAP:
-                    if i[1][0] in (EAP_REQUEST,) and i[1][2] in (EAP_AKA,):
+                    eap_summary = 'code=%s type=%s' % (i[1][0], i[1][2] if len(i[1]) > 2 else '-')
+                    if i[1][0] in (EAP_REQUEST,) and i[1][2] == EAP_IDENTITY:
+                        # Lebara UK's ePDG (234-87) opens with a bare RFC 3748
+                        # EAP-Request/Identity before starting EAP-AKA (issue #43);
+                        # answer with the NAI and resend, like the AKA-Identity path.
+                        self.eap_identifier = i[1][1]
+                        identity = (
+                                '0'
+                                + self.imsi
+                                + '@nai.epc.mnc' + self.mnc
+                                + '.mcc' + self.mcc
+                                + '.3gppnetwork.org'
+                        )
+                        self.eap_payload_response = build_eap_identity_response(self.eap_identifier, identity)
+                        return REPEAT_STATE,'EAP IDENTITY REQUESTED'
+
+                    elif i[1][0] in (EAP_REQUEST,) and i[1][2] in (EAP_AKA,):
                         if i[1][3] in (AKA_Challenge, AKA_Reauthentication):
                             
                             eap_received = True
@@ -4310,7 +4534,7 @@ class swu():
                         elif i[1][3] in (AKA_Identity,):
                             
                       
-                            if i[1][4][0][0] in (AT_ANY_ID_REQ, AT_IDENTITY):
+                            if requests_permanent_eap_identity(i[1][4]):
                                 self.eap_identifier = i[1][1]
                                 identity = (
                                         '0'
@@ -4337,6 +4561,9 @@ class swu():
 
             if eap_received == True:
                 return OK,''               
+            elif eap_summary is not None:
+                # An EAP payload WAS present — we just don't handle this method.
+                return MANDATORY_INFORMATION_MISSING,'UNHANDLED EAP PAYLOAD (%s)' % eap_summary
             else:
                 return MANDATORY_INFORMATION_MISSING,'NO EAP PAYLOAD RECEIVED'              
             
@@ -4581,6 +4808,15 @@ class swu():
                         self.send_data(packet)
                         print('answering INFORMATIONAL (DELETE IKE)')
                         if self.old_ike_message_received == False:
+                            # The ePDG, not us, ended this tunnel. That distinction is the whole
+                            # story behind the periodic outages (one carrier tears down on a
+                            # ~24h timer regardless of how recently the SA was rekeyed), and it
+                            # was previously only visible by reading the archived IKE log by
+                            # hand. Record it as an event so the timeline shows who hung up.
+                            swu_log("ePDG tore down the tunnel (peer-initiated DELETE IKE) "
+                                    "after %ds" % self.seconds_since_connect())
+                            swu_notify("tunnel_deleted_by_peer",
+                                       str(self.seconds_since_connect()))
                             self.ike_to_ipsec_encoder.send(bytes([INTER_PROCESS_DELETE_SA]))
                             self.ike_to_ipsec_decoder.send(bytes([INTER_PROCESS_DELETE_SA]))
                             self.delete_routes()
@@ -5044,15 +5280,19 @@ class swu():
         inner = (self.ipv6_address_list[0] if self.ipv6_address_list
                  else (self.ip_address_list[0] if self.ip_address_list else ""))
         swu_write_pcscf(pcscf)
+        # Stamped so a later teardown can report how long this tunnel actually lasted. The
+        # carrier-side lifetimes only became legible once the durations were in the log next to
+        # who initiated the teardown.
+        self._connected_at = time.time()
         swu_write_status("CONNECTED", inner_ip=inner, pcscf=pcscf, iface=self.tun_device)
         swu_log("tunnel CONNECTED inner=%s pcscf=%s iface=%s" % (inner, pcscf, self.tun_device))
         swu_notify("tunnel_up")
         if pcscf:
             swu_notify("pcscf", pcscf)
-            # Keep pjsip's P-CSCF (identify/resolve/register) in sync when the ePDG assigns a
-            # different P-CSCF on reconnect/reauth. No-op on first bring-up (entrypoint seeds
-            # pcscf.applied after its own initial render, before Asterisk starts).
-            swu_apply_pcscf(pcscf)
+            # A full attach means a new inner address, so Asterisk must re-register from it
+            # whether or not the P-CSCF changed. On first bring-up Asterisk is not running yet
+            # and this only renders the config it will start with (see swu_apply_pcscf).
+            swu_apply_pcscf(pcscf, tunnel_rebuilt=True)
 
         # Headless control channel replaces interactive stdin. Open a FIFO O_RDWR so select()
         # never sees EOF (a plain stdin/EOF would busy-spin). The manager/entrypoint can echo
@@ -5403,7 +5643,8 @@ class swu():
         IKE rekey (state_ue_create_sa). Staying the initiator keeps every role assumption in this
         file valid AND resets the ePDG's own rekey clock — the whole point, since we refuse the
         responder role and an ePDG-initiated rekey therefore ends in a teardown (EE does this at
-        ~12 h SA age; keep SWU_IKE_REKEY_MINUTES comfortably below that).
+        ~12 h SA age; giffgaff/O2 UK instead ages the session out silently at ~2h50m — keep
+        SWU_IKE_REKEY_MINUTES comfortably below the shortest carrier clock in use).
 
         An explicit rejection keeps the established IKE SA (retry in ike_rekey_retry_interval).
         An unanswered request is retransmitted verbatim; exhausting the retransmissions leaves the
@@ -5766,8 +6007,13 @@ def get_default_gateway_linux():
             return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16))), fields[0]
 
 def get_default_source_address():
-
-    proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + get_default_gateway_linux()[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
+    # Evaluated eagerly as the -s default, even when -s is given. A container Engine behind a
+    # country exit sits on an internal Docker network with no default route, and this used to
+    # raise TypeError before the entrypoint's -s could apply, so the line never started.
+    gateway = get_default_gateway_linux()
+    if not gateway:
+        return None
+    proc = subprocess.Popen("/sbin/ifconfig | grep -A 1 " + gateway[1] + " | grep inet", stdout=subprocess.PIPE, shell=True)
     output = str(proc.stdout.read())
     if 'addr:' in output:
         addr = output.split('addr:')[1].split()[0]
@@ -6001,8 +6247,19 @@ def _with_deadline(fn, timeout=None):
     return box.get("value")
 
 
+_ICCID_BYTES = 10
+_ICCID_MIN_DIGITS = 15
+
+
 def read_iccid_at_index(reader_index):
-    """Read EF.ICCID from a reader index. No PIN needed; None when the card will not answer."""
+    """Read EF.ICCID from a reader index. No PIN needed; None when it will not answer readably.
+
+    EF.ICCID is exactly 10 BCD bytes (TS 31.102). A short read, or a value that is not
+    all digits, is a card or reader fault rather than an identity -- and every caller
+    convicts a reader on ANY non-empty ICCID that differs from the line's, so handing one
+    a truncated value would strand a line whose binding is perfectly correct. Returning
+    None keeps the documented fail-open direction: we simply cannot convict.
+    """
     r = readers()
     connection = r[int(reader_index)].createConnection()
     connection.connect()
@@ -6010,9 +6267,10 @@ def read_iccid_at_index(reader_index):
         connection.transmit(toBytes('00A40000023F00'))
         connection.transmit(toBytes('00A40000022FE2'))
         data, sw1, sw2 = connection.transmit(toBytes('00B000000A'))
-        if sw1 != 0x90:
+        if sw1 != 0x90 or len(data) != _ICCID_BYTES:
             return None
-        return bcd(toHexString(data).replace(" ", "")).rstrip("Ff")
+        iccid = bcd(toHexString(data).replace(" ", "")).rstrip("Ff")
+        return iccid if iccid.isdigit() and len(iccid) >= _ICCID_MIN_DIGITS else None
     finally:
         try:
             connection.disconnect()
@@ -6108,19 +6366,59 @@ def read_res_ck_ik_2(reader_index,rand,autn):
 _USIM_AID_PREFIX = "A0000000871002"
 
 
+def _swu_apdu_with_le(apdu, le):
+    """Rebuild an APDU carrying the Le the card asked for in a 6Cxx status. Case 2 replaces
+    the trailing Le byte; case 3/4 keeps Lc and the command data and re-stamps only Le.
+    Truncating to CLA/INS/P1/P2 (what the first version did) turned a case-4 SELECT into a
+    malformed command, so the retry failed and a healthy file read as unselectable."""
+    head = list(apdu[:4])
+    if len(apdu) <= 5:
+        return head + [le]
+    lc = apdu[4]
+    return head + [lc] + list(apdu[5:5 + lc]) + [le]
+
+
+def _swu_xfr(conn, apdu):
+    """Transmit one APDU, normalizing reader/protocol variance (issue #51). TPDU-level
+    T=0 readers answer case-4 commands with 61xx and expect an explicit GET RESPONSE;
+    APDU-level readers and T=1 hand back the data with 9000 directly. 6Cxx means
+    "wrong Le, retry with mine". Callers see one shape: (data, 0x90, 0x00) on success.
+
+    61xx already means the card ACCEPTED the command -- the GET RESPONSE that follows only
+    fetches the body. Reporting that fetch's status as the command's status made a good
+    SELECT ADF.USIM read as a card fault on cards whose GET RESPONSE answers anything but
+    9000, which is issue #60: read_card bailed out with no PIN state at all and the start
+    preflight then asked for a PIN the card never wanted. Callers that need the body check
+    the body they got, so answering "accepted, here is what we could fetch" is safe."""
+    data, s1, s2 = conn.transmit(apdu)
+    data = list(data)
+    accepted = False
+    for _ in range(8):      # bound: a card that keeps re-asking cannot spin us forever
+        if s1 == 0x61:
+            accepted = True
+            more, s1, s2 = conn.transmit([0x00, 0xC0, 0x00, 0x00, s2])
+            data += list(more)
+            continue
+        if s1 == 0x6C and s2 and not accepted:
+            data, s1, s2 = conn.transmit(_swu_apdu_with_le(apdu, s2))
+            data = list(data)
+            continue
+        break
+    if accepted and s1 != 0x90:
+        return data, 0x90, 0x00
+    return data, s1, s2
+
+
 def _swu_select_adf_usim(conn):
     conn.transmit(toBytes("00a40004023f0000"))               # SELECT MF
-    d, s1, s2 = conn.transmit(toBytes("00a40004022f0000"))   # SELECT EF.DIR
-    if s1 != 0x61:
-        return False
-    fcp, s1, s2 = conn.transmit(toBytes("00C00000") + [s2])
+    fcp, s1, s2 = _swu_xfr(conn, toBytes("00a40004022f0000"))  # SELECT EF.DIR
     if s1 != 0x90 or len(fcp) < 8:
         return False
     rec_len = fcp[7]
     aid = None
     first = None
     for rec in range(1, 11):
-        d, s1, s2 = conn.transmit(toBytes("00b2") + [rec, 0x04, rec_len])
+        d, s1, s2 = _swu_xfr(conn, toBytes("00b2") + [rec, 0x04, rec_len])
         if s1 != 0x90 or len(d) < 5 or d[0] != 0x61 or d[2] != 0x4F:
             break
         aid_len = d[3]
@@ -6137,8 +6435,8 @@ def _swu_select_adf_usim(conn):
     if aid is None:
         return False
     aid_len, a = aid
-    d, s1, s2 = conn.transmit(toBytes("00a40404") + [aid_len] + toBytes(a))
-    return s1 == 0x61
+    d, s1, s2 = _swu_xfr(conn, toBytes("00a40404%02X%s" % (aid_len, a)))
+    return s1 == 0x90
 
 
 def _swu_verify_chv1(conn, pin):
@@ -6152,6 +6450,9 @@ def _swu_verify_chv1(conn, pin):
             return False
     elif (s1, s2) == (0x69, 0x83):
         print("VoWiFi: CHV1 blocked")
+        return False
+    if not (4 <= len(pin) <= 8) or not pin.isdigit():
+        print("VoWiFi: refusing PIN VERIFY, malformed PIN (want 4-8 digits)")
         return False
     body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
     d, s1, s2 = conn.transmit(toBytes("00200001") + [0x08] + body)
@@ -6433,42 +6734,6 @@ def main():
         print("[swu_ike] CP mode pinned: %s" % _cp_mode)
 
 
-    # IKE proposals. Telus' ePDG rejects the emulator's stock SHA1/MD5 list with
-    # NO_PROPOSAL_CHOSEN; it requires PRF/INTEG SHA2-256. This list mirrors the engine's
-    # render.py default_ike (the set proven with strongSwan on Telus). MODP_2048 MUST be first
-    # because the IKE_SA_INIT KE payload is derived from the first proposal's DH group.
-    sa_list = [
-    [
-       [IKE,0],
-       [ENCR,ENCR_AES_CBC,[KEY_LENGTH,256]],
-       [PRF,PRF_HMAC_SHA2_256],
-       [INTEG,AUTH_HMAC_SHA2_256_128],
-       [D_H,MODP_2048_bit]
-    ]    ,
-    [
-       [IKE,0],
-       [ENCR,ENCR_AES_CBC,[KEY_LENGTH,128]],
-       [PRF,PRF_HMAC_SHA2_256],
-       [INTEG,AUTH_HMAC_SHA2_256_128],
-       [D_H,MODP_2048_bit]
-    ]    ,
-    [
-       [IKE,0],
-       [ENCR,ENCR_AES_CBC,[KEY_LENGTH,256]],
-       [PRF,PRF_HMAC_SHA1],
-       [INTEG,AUTH_HMAC_SHA1_96],
-       [D_H,MODP_2048_bit]
-    ]    ,
-    [
-       [IKE,0],
-       [ENCR,ENCR_AES_CBC,[KEY_LENGTH,128]],
-       [PRF,PRF_HMAC_SHA1],
-       [INTEG,AUTH_HMAC_SHA1_96],
-       [D_H,MODP_2048_bit]
-    ]
-    ]
-
-
     # Child/ESP proposals. AES_CBC_128/HMAC_SHA1_96 first — the transform Telus selected with
     # strongSwan (render.py default_esp). Remaining kept as fallbacks. No DH transform here
     # (no PFS at initial IKE_AUTH).
@@ -6517,7 +6782,9 @@ def main():
                       help="IMEISV (16 digits) for DEVICE_IDENTITY; auto-derived from IMEI if blank")
 
     (options, args) = parser.parse_args()
-    
+    sa_list = ike_proposals_for_plmn(options.mcc, options.mnc)
+    if (str(options.mcc).zfill(3), str(options.mnc).zfill(3)) == ("515", "066"):
+        print("[swu_ike] DITO 515-66: using AES-CBC-128/SHA1/MODP-1024 IKE proposal")
     try:
         destination_addr = socket.gethostbyname(options.destination_addr)
     except:
@@ -6549,6 +6816,8 @@ def main():
                              iccid=_foreign, expected=_want_iccid)
             exit(1)
 
+    if not options.source_addr:
+        parser.error("no IKE source address: pass -s, the host has no default route to derive one")
     a = swu(options.source_addr,destination_addr,options.apn,modem,options.gateway_ip_address,options.mcc,options.mnc,options.imsi,options.netns)
 
     if options.imsi == DEFAULT_IMSI: a.get_identity()

@@ -36,21 +36,35 @@ def render(**overrides) -> str:
 class DialplanTests(unittest.TestCase):
     def test_disabled_leaves_the_inbound_path_exactly_as_it_was(self):
         out = render(vm_enabled=False)
-        self.assertIn("same => n,Dial(PJSIP/webrtc,60)", out)
+        self.assertIn("Set(BROWSER_PICKUP_DEADLINE=$[${EPOCH}+60])", out)
+        self.assertIn("Set(BROWSER_CONTACTS=${PJSIP_DIAL_CONTACTS(webrtc)})", out)
+        self.assertIn("same => n,Dial(PJSIP/webrtc,${BROWSER_PICKUP_REMAINING})", out)
+        self.assertIn("same => n(unanswered),NoOp(Browser pickup window expired)", out)
         self.assertNotIn("Record(", out)
         self.assertNotIn("[mdd_voicemail]", out)
 
     def test_enabled_replaces_the_ring_timeout_and_branches_to_the_recorder(self):
         out = render(vm_enabled=True)
-        self.assertIn("same => n,Dial(PJSIP/webrtc,25)", out)
+        self.assertIn("Set(BROWSER_PICKUP_DEADLINE=$[${EPOCH}+25])", out)
+        self.assertIn("same => n(unanswered),GotoIf", out)
         self.assertIn("same => n,Goto(mdd_voicemail,vm,1)", out)
         self.assertIn("Record(/logs/voicemail/", out)
+
+    def test_an_offline_browser_is_waited_for_without_extending_the_answer_window(self):
+        out = render(vm_enabled=True)
+        wait = out.index("same => n(wait_browser),Set(BROWSER_CONTACTS=")
+        dial = out.index("same => n(dial_browser),Set(BROWSER_PICKUP_REMAINING=")
+        voicemail = out.index("same => n,Goto(mdd_voicemail,vm,1)")
+        self.assertLess(wait, dial)
+        self.assertLess(dial, voicemail)
+        self.assertIn('GotoIf($["${DIALSTATUS}"="CHANUNAVAIL" & '
+                      '${EPOCH}<${BROWSER_PICKUP_DEADLINE}]?wait_browser)', out)
 
     def test_a_declined_call_is_never_recorded(self):
         # BUSY on the inbound Dial means the user pressed decline. Recording then would be the
         # opposite of what they just asked for.
         out = render(vm_enabled=True)
-        self.assertIn('same => n,GotoIf($["${DIALSTATUS}"="BUSY"]?bye)', out)
+        self.assertIn('same => n(unanswered),GotoIf($["${DIALSTATUS}"="BUSY"]?bye)', out)
         self.assertLess(out.index('GotoIf($["${DIALSTATUS}"="BUSY"]?bye)'),
                         out.index("Goto(mdd_voicemail,vm,1)"))
 
@@ -71,12 +85,41 @@ class DialplanTests(unittest.TestCase):
         self.assertNotIn("context=mdd_voicemail",
                          (ROOT / "engine" / "templates" / "pjsip.conf.j2").read_text())
 
-    def test_the_hangup_handler_keeps_its_load_bearing_return(self):
-        # Without Return() the 'h' routine falls through to the catch-all and fires a phantom
-        # second call_in for every call.
+    def test_plain_h_handlers_end_with_hangup_not_return(self):
+        # Both are ordinary special extensions, not Gosub routines. They still need an explicit
+        # terminal application: otherwise [volte_ims]'s catch-all can match h at the next priority
+        # and fire a phantom call_in, but Return() emits "Return without Gosub" on every call.
         out = render(vm_enabled=True)
-        handler = out.split("exten => h,1,")[1]
-        self.assertIn("same => n,Return()", handler.split("\n\n")[0])
+        for context_name in ("volte_ims", "from-local"):
+            context = out.split(f"[{context_name}]", 1)[1].split("\n[", 1)[0]
+            handler = context.split("exten => h,1,", 1)[1].split("\n\n", 1)[0]
+            self.assertNotIn("Return()", handler, context_name)
+            self.assertTrue(handler.rstrip().endswith("same => n,Hangup()"), context_name)
+
+    def test_gosub_routines_keep_their_returns(self):
+        out = render(vm_enabled=True)
+        outbound_headers = out.split("[ims-outbound-headers]", 1)[1].split("\n[", 1)[0]
+        ussd_report = out.split("[ussd-report]", 1)[1].split("\n[", 1)[0]
+        self.assertIn("same => n,Return()", outbound_headers)
+        self.assertIn("same => n(done),Return()", ussd_report)
+        hangup_by = out.split("[hangup-by]", 1)[1].split("\n[", 1)[0]
+        self.assertIn("same => n,Return(${BY})", hangup_by)
+
+    def test_both_h_handlers_report_which_side_ended_the_call(self):
+        # ANSWER/16 after one second reads the same whether the carrier, the browser or the
+        # gateway tore the call down (#109); the 'h' handlers name the side as a 5th argument.
+        out = render(vm_enabled=True)
+        for direction in ("in", "out"):
+            line = next(l for l in out.splitlines() if f"call_result {direction} " in l)
+            self.assertIn('"${GOSUB_RETVAL}" &)', line, direction)
+            handler = out[:out.index(line)].rsplit("exten => h,1,", 1)[1]
+            self.assertIn("Gosub(hangup-by,s,1)", handler, direction)
+        routine = out.split("[hangup-by]", 1)[1].split("\n[", 1)[0]
+        # The carrier's channel is named after its endpoint; a browser/MicroSIP leg is not.
+        self.assertIn('"${HS:0:16}" = "PJSIP/volte_ims-"', routine)
+        self.assertIn('?Set(BY=carrier)', routine)
+        self.assertIn('?gateway:local', routine)
+        self.assertTrue(routine.rstrip().endswith("same => n,Return(${BY})"))
 
     def test_the_prompt_is_shipped_rather_than_assumed(self):
         # The base image's Asterisk sound packages are a side effect of its build; nothing

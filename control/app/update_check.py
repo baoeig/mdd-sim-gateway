@@ -20,10 +20,12 @@ from .version import VERSION
 
 DEFAULT_REPOSITORY = "MddIdd/mdd-sim-gateway"
 _cache: tuple[float, dict] | None = None
+_releases_cache: tuple[float, dict] | None = None
 _stars_cache: int | None = None
 _stars_checked_at = 0.0
 _STARS_CACHE_SECONDS = 15 * 60
 _MAX_RELEASE_NOTES_CHARS = 16_000
+_MANUAL_STABLE_RELEASE_LIMIT = 5
 # How long a "running" progress document may go unrefreshed before it stops counting as proof
 # that an update is alive. The orchestrator retires abandoned runs within a minute by asking
 # systemd whether the updater unit still exists; these are the control plane's own fallback for
@@ -42,16 +44,21 @@ def validate_network_settings(value: dict | None) -> dict:
     """Validate and normalize the persisted update networking selection."""
     value = value or {}
     mode = str(value.get("proxy_mode") or "auto").strip().lower()
-    if mode in {"manual", "country"}:
+    if mode == "manual":
         mode = "auto"
-    if mode not in {"auto", "direct", "library"}:
-        raise UpdateNetworkError("update proxy mode must be auto, direct or library")
+    if mode not in {"auto", "direct", "library", "country"}:
+        raise UpdateNetworkError("update proxy mode must be auto, direct, library or country")
     result = {"proxy_mode": mode, "proxy_profile_id": ""}
     if mode == "library":
         profile_id = str(value.get("proxy_profile_id") or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", profile_id):
             raise UpdateNetworkError("select a proxy from the proxy library for software updates")
         result["proxy_profile_id"] = profile_id
+    elif mode == "country":
+        country = str(value.get("proxy_country") or "").strip().lower()
+        if not re.fullmatch(r"[a-z]{2}", country):
+            raise UpdateNetworkError("select a country exit for software updates")
+        result["proxy_country"] = country
     return result
 
 
@@ -91,6 +98,10 @@ def _network_selection() -> dict:
         profiles = (settings.get("proxy") or {}).get("profiles") or {}
         if selection["proxy_profile_id"] not in profiles:
             raise UpdateNetworkError("selected update proxy is no longer in the proxy library")
+    elif selection["proxy_mode"] == "country":
+        exits = (settings.get("proxy") or {}).get("exits") or {}
+        if selection["proxy_country"] not in exits:
+            raise UpdateNetworkError("selected update country exit is no longer configured")
     return selection
 
 
@@ -102,7 +113,8 @@ def _network_candidates() -> list[dict]:
     profiles = ((cfg.get_settings().get("proxy") or {}).get("profiles") or {})
     return [{"proxy_mode": "direct", "proxy_profile_id": ""}] + [
         {"proxy_mode": "library", "proxy_profile_id": str(profile_id)}
-        for profile_id in profiles
+        for profile_id, profile in profiles.items()
+        if isinstance(profile, dict) and profile.get("type") != "subscription"
         if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", str(profile_id))
     ]
 
@@ -137,6 +149,19 @@ def _proxy_url(selection: dict) -> str:
         return ""
     from . import config as cfg, egress
     settings = cfg.get_settings()
+    if mode == "country":
+        country = selection["proxy_country"]
+        exit_cfg = ((settings.get("proxy") or {}).get("exits") or {}).get(country) or {}
+        state = (egress.status().get("exits") or {}).get(country) or {}
+        try:
+            port = int(state.get("proxy_port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        host = str(state.get("proxy_host") or "").strip()
+        if not exit_cfg.get("enabled") or not state.get("ready") \
+                or not host or not 1 <= port <= 65535:
+            raise UpdateNetworkError("selected country exit is not ready")
+        return f"socks5h://{host}:{port}"
     profile_id = selection["proxy_profile_id"]
     profile = ((settings.get("proxy") or {}).get("profiles") or {}).get(profile_id) or {}
     if profile.get("type") == "socks5":
@@ -175,6 +200,31 @@ def _version_tuple(value: str) -> tuple[int, ...]:
         return tuple(int(part) for part in core.split("."))
     except ValueError:
         return (0,)
+
+
+def _version_key(value: str) -> tuple:
+    """Comparable release key where a final release follows its prereleases.
+
+    ``_version_tuple`` remains the public core-version helper used by existing callers. This
+    richer key is used for update decisions so v1.6.1 is newer than v1.6.1-rc2, while natural
+    numeric chunks also keep rc10 after rc2.
+    """
+    text = str(value).strip().removeprefix("v")
+    core_text, separator, prerelease = text.partition("-")
+    try:
+        core = tuple(int(part) for part in core_text.split("."))
+    except ValueError:
+        return ((0,), 0, ())
+    if not separator:
+        return (core, 1, ())
+    chunks = []
+    for identifier in prerelease.lower().split("."):
+        natural = tuple(
+            (0, int(part)) if part.isdigit() else (1, part)
+            for part in re.findall(r"\d+|[^\d]+", identifier)
+        )
+        chunks.append(natural)
+    return (core, 0, tuple(chunks))
 
 
 def _stargazers(session, headers: dict, repository_name: str) -> int | None:
@@ -225,11 +275,188 @@ def repository_stars(force: bool = False) -> dict:
             "checked_at": int(_stars_checked_at or 0), "cached": _stars_cache is not None}
 
 
+def _release_result(payload: dict, selection: dict, repository_name: str,
+                    *, session=None, headers: dict | None = None, include_stars: bool = False) -> dict:
+    """Normalize one GitHub Release response for manual or automatic installation."""
+    latest = str(payload.get("tag_name") or "").removeprefix("v")
+    assets = {}
+    for asset in payload.get("assets") or []:
+        name = str((asset or {}).get("name") or "")
+        try:
+            size = int((asset or {}).get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if name and 0 < size < 20 * 1024 * 1024 * 1024:
+            assets[name] = size
+    result = {
+        "ok": bool(latest),
+        "current": VERSION,
+        "repository": repository_name,
+        "latest": latest,
+        "update_available": _version_key(latest) > _version_key(VERSION),
+        "release_url": str(payload.get("html_url") or ""),
+        "published_at": str(payload.get("published_at") or ""),
+        "notes": str(payload.get("body") or "")[:_MAX_RELEASE_NOTES_CHARS],
+        "name": str(payload.get("name") or ""),
+        "prerelease": bool(payload.get("prerelease")),
+        "network": selection,
+        "asset_sizes": assets,
+        "checked_at": int(time.time()),
+    }
+    if include_stars and session is not None and headers is not None:
+        result["stars"] = _stargazers(session, headers, repository_name)
+    return result
+
+
+def releases(force: bool = False) -> dict:
+    """List manually selectable Releases.
+
+    The five latest stable Releases are normal-version choices. Published GitHub prereleases are
+    exposed as test versions; drafts are never returned. Limiting the stable history keeps this
+    useful for recent rollback without turning it into a general-purpose downgrade browser.
+    """
+    global _releases_cache
+    now = time.time()
+    if not force and _releases_cache and now - _releases_cache[0] < 300:
+        return dict(_releases_cache[1])
+    repository_name = repository()
+    url = f"https://api.github.com/repos/{repository_name}/releases?per_page=30"
+    result = {"ok": False, "current": VERSION, "repository": repository_name,
+              "releases": [], "checked_at": int(now)}
+    last_error: Exception | None = None
+    try:
+        candidates = _network_candidates()
+    except UpdateNetworkError as exc:
+        candidates, last_error = [], exc
+    for selection in candidates:
+        try:
+            session = _session(selection)
+            response = session.get(url, headers=_github_headers(), timeout=12)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise ValueError("GitHub Releases response is not a list")
+            stable_count = 0
+            choices = []
+            for release in payload:
+                if not isinstance(release, dict) or release.get("draft"):
+                    continue
+                version = str(release.get("tag_name") or "").removeprefix("v")
+                if not re.fullmatch(r"\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?", version):
+                    continue
+                prerelease = bool(release.get("prerelease"))
+                if not prerelease and stable_count >= _MANUAL_STABLE_RELEASE_LIMIT:
+                    continue
+                stable_count += int(not prerelease)
+                item = _release_result(release, selection, repository_name)
+                # Manual channel switching may move to an older stable version, so equality —
+                # not semantic ordering — decides whether there is something to install.
+                item["update_available"] = version != VERSION
+                choices.append(item)
+            result.update(ok=True, releases=choices, network=selection)
+            last_error = None
+            break
+        except requests.HTTPError as exc:
+            last_error = exc
+            code = exc.response.status_code if exc.response is not None else 0
+            if code in {401, 404}:
+                break
+        except (requests.RequestException, UpdateNetworkError, OSError, ValueError,
+                TypeError) as exc:
+            last_error = exc
+    if isinstance(last_error, requests.HTTPError):
+        code = last_error.response.status_code if last_error.response is not None else 0
+        result.update(error="No published releases are available" if code in {401, 404}
+                      else "GitHub update check was rate-limited" if code == 403
+                      else f"GitHub returned HTTP {code}",
+                      error_code="update.error.no_release" if code in {401, 404}
+                      else "update.error.rate_limited" if code == 403
+                      else "update.error.github")
+    elif isinstance(last_error, UpdateNetworkError):
+        result.update(error=str(last_error), error_code="update.error.proxy")
+    elif last_error is not None:
+        result.update(error=f"Update service unavailable: {type(last_error).__name__}",
+                      error_code="update.error.unavailable")
+    _releases_cache = (now, result)
+    return dict(result)
+
+
+def _release_candidates(preferred: dict | None = None) -> list[dict]:
+    candidates = _network_candidates()
+    if preferred:
+        candidates = [preferred] + [item for item in candidates if item != preferred]
+    return candidates
+
+
+def check_release(version: str, preferred_network: dict | None = None, *,
+                  allow_prerelease: bool = False, allow_older: bool = False) -> dict:
+    """Fetch one configured stable Release, even when a newer patch is GitHub's latest.
+
+    Main-only devices need this tagged lookup: once a patch is newest, ``releases/latest`` can
+    no longer describe the older main release they are explicitly meant to converge on.
+    """
+    target = str(version or "").strip().removeprefix("v")
+    repository_name = repository()
+    result = {"ok": False, "current": VERSION, "repository": repository_name,
+              "latest": target, "update_available": False, "checked_at": int(time.time())}
+    version_pattern = (r"\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?" if allow_prerelease
+                       else r"\d+\.\d+\.\d+")
+    if not re.fullmatch(version_pattern, target):
+        result.update(error="Configured update target is invalid",
+                      error_code="update.error.invalid_policy")
+        return result
+    url = (f"https://api.github.com/repos/{repository_name}/releases/tags/"
+           f"{quote('v' + target, safe='')}")
+    headers = _github_headers()
+    last_error: Exception | None = None
+    try:
+        candidates = _release_candidates(preferred_network)
+    except UpdateNetworkError as exc:
+        candidates, last_error = [], exc
+    for selection in candidates:
+        try:
+            session = _session(selection)
+            response = session.get(url, headers=headers, timeout=12)
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("draft") or (payload.get("prerelease") and not allow_prerelease):
+                raise ValueError("configured update target is not a stable Release")
+            candidate = _release_result(payload, selection, repository_name)
+            if candidate.get("latest") != target:
+                raise ValueError("configured Release tag does not match its payload")
+            if allow_older:
+                candidate["update_available"] = target != VERSION
+            return candidate
+        except requests.HTTPError as exc:
+            last_error = exc
+            code = exc.response.status_code if exc.response is not None else 0
+            if code in {401, 404}:
+                break
+        except (requests.RequestException, UpdateNetworkError, OSError, ValueError, TypeError) as exc:
+            last_error = exc
+    if isinstance(last_error, requests.HTTPError):
+        code = last_error.response.status_code if last_error.response is not None else 0
+        result.update(
+            error=("Configured update Release is unavailable" if code in {401, 404}
+                   else "GitHub update check was rate-limited" if code == 403
+                   else f"GitHub returned HTTP {code}"),
+            error_code=("update.error.no_release" if code in {401, 404}
+                        else "update.error.rate_limited" if code == 403
+                        else "update.error.github"),
+        )
+    elif isinstance(last_error, UpdateNetworkError):
+        result.update(error=str(last_error), error_code="update.error.proxy")
+    elif last_error is not None:
+        result.update(error=f"Update service unavailable: {type(last_error).__name__}",
+                      error_code="update.error.unavailable")
+    return result
+
+
 def check(force: bool = False) -> dict:
     global _cache
     now = time.time()
     if not force and _cache and now - _cache[0] < 300:
-        return dict(_cache[1])
+        return _with_automation_check(dict(_cache[1]))
     repository_name = repository()
     url = f"https://api.github.com/repos/{repository_name}/releases/latest"
     headers = _github_headers()
@@ -246,27 +473,9 @@ def check(force: bool = False) -> dict:
             response = session.get(url, headers=headers, timeout=12)
             response.raise_for_status()
             payload = response.json()
-            latest = str(payload.get("tag_name") or "").removeprefix("v")
-            assets = {}
-            for asset in payload.get("assets") or []:
-                name = str((asset or {}).get("name") or "")
-                try:
-                    size = int((asset or {}).get("size") or 0)
-                except (TypeError, ValueError):
-                    size = 0
-                if name and 0 < size < 20 * 1024 * 1024 * 1024:
-                    assets[name] = size
-            result.update({
-                "ok": bool(latest),
-                "latest": latest,
-                "update_available": _version_tuple(latest) > _version_tuple(VERSION),
-                "release_url": str(payload.get("html_url") or ""),
-                "published_at": str(payload.get("published_at") or ""),
-                "notes": str(payload.get("body") or "")[:_MAX_RELEASE_NOTES_CHARS],
-                "network": selection,
-                "asset_sizes": assets,
-                "stars": _stargazers(session, headers, repository_name),
-            })
+            result.update(_release_result(payload, selection, repository_name,
+                                          session=session, headers=headers,
+                                          include_stars=True))
             last_error = None
             break
         except requests.HTTPError as exc:
@@ -296,7 +505,7 @@ def check(force: bool = False) -> dict:
         result["error"] = f"Update service unavailable: {type(last_error).__name__}"
         result["error_code"] = "update.error.unavailable"
     _cache = (now, result)
-    return dict(result)
+    return _with_automation_check(dict(result))
 
 
 def _policy_url() -> str:
@@ -314,40 +523,99 @@ def _policy_time(value: str) -> datetime | None:
         return None
 
 
-def auto_update_authorization(info: dict, now: datetime | None = None) -> dict:
-    """Read classification and promotion policy for the latest discovered Release.
-
-    A GitHub Release alone never authorizes unattended installation. The repository owner
-    classifies it explicitly as main/patch and promotes it later by changing
-    update-policy.json, optionally with a future not_before time. Keeping this lookup separate
-    from ``check`` means a policy outage never hides a release from manual update.
-    """
-    latest = str(info.get("latest") or "")
-    result = {"authorized": False, "version": latest, "reason": "not_promoted"}
-    if not info.get("update_available") or not latest:
-        result["reason"] = "not_available"
-        return result
+def _load_update_policy(info: dict) -> dict | None:
     selection = info.get("network") or _network_selection()
     try:
         response = _session(selection).get(_policy_url(), headers=_github_headers(), timeout=12)
         response.raise_for_status()
         policy = response.json()
     except (requests.RequestException, UpdateNetworkError, OSError, ValueError, TypeError):
+        return None
+    return policy if isinstance(policy, dict) else None
+
+
+def _valid_policy(policy: dict | None) -> bool:
+    try:
+        return isinstance(policy, dict) and int(policy.get("schema") or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _channel_entry(policy: dict, scope: str) -> dict | None:
+    channels = policy.get("channels")
+    if not isinstance(channels, dict):
+        return None
+    entry = channels.get(scope)
+    return entry if isinstance(entry, dict) else {}
+
+
+def _policy_target(policy: dict | None, scope: str, latest: str) -> str:
+    """Version one preference cohort should converge on under this policy.
+
+    ``all`` remains tied to GitHub's latest Release so a stale promotion cannot silently turn
+    into a downgrade channel. ``main`` may name an older tagged Release explicitly; that is the
+    capability the old latest-only design lacked once a patch had been published after it.
+    """
+    if not _valid_policy(policy) or scope not in {"all", "main"}:
+        return ""
+    entry = _channel_entry(policy, scope)
+    if entry is not None:
+        version = str(entry.get("version") or "").strip().removeprefix("v")
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            return ""
+        return version if scope == "main" or version == latest else ""
+    # Backward-compatible policy: one promotion applied to the latest Release, and the release
+    # classification decided whether main-only devices considered it.
+    if scope == "all":
+        return latest
+    release = policy.get("release") or {}
+    if (isinstance(release, dict)
+            and str(release.get("version") or "").removeprefix("v") == latest
+            and str(release.get("kind") or "").strip().lower() == "main"):
+        return latest
+    return ""
+
+
+def auto_update_authorization(info: dict, now: datetime | None = None, *,
+                              scope: str = "all", policy: dict | None = None) -> dict:
+    """Authorize one cohort's configured Release after its rollout time.
+
+    A GitHub Release alone never authorizes unattended installation. The repository owner
+    promotes the ``all`` and ``main`` targets independently, optionally with different future
+    ``not_before`` times. Policies without channels retain the v1.5.0-v1.5.3 single-target
+    behavior so already-installed gateways can bootstrap through v1.5.4.
+    """
+    latest = str(info.get("latest") or "")
+    result = {"authorized": False, "version": latest, "scope": scope,
+              "reason": "not_promoted"}
+    if not info.get("update_available") or not latest:
+        result["reason"] = "not_available"
+        return result
+    if policy is None:
+        policy = _load_update_policy(info)
+    if policy is None:
         result["reason"] = "policy_unavailable"
         return result
-    promoted = (policy.get("auto_update") if isinstance(policy, dict) else None) or {}
-    classified = (policy.get("release") if isinstance(policy, dict) else None) or {}
-    try:
-        schema = int(policy.get("schema") or 0) if isinstance(policy, dict) else 0
-    except (TypeError, ValueError):
-        schema = 0
-    if not isinstance(promoted, dict) or not isinstance(classified, dict) or schema != 1:
+    if not _valid_policy(policy) or scope not in {"all", "main"}:
+        result["reason"] = "invalid_policy"
+        return result
+    target = _policy_target(policy, scope, latest)
+    result["target_version"] = target
+    if target != latest:
+        return result
+    promoted = _channel_entry(policy, scope)
+    if promoted is None:
+        promoted = policy.get("auto_update") or {}
+    classified = policy.get("release") or {}
+    if not isinstance(promoted, dict) or not isinstance(classified, dict):
         result["reason"] = "invalid_policy"
         return result
     if str(classified.get("version") or "").removeprefix("v") == latest:
         release_kind = str(classified.get("kind") or "").strip().lower()
         if release_kind in {"main", "patch"}:
             result["release_kind"] = release_kind
+    if scope == "main" and _channel_entry(policy, scope) is not None:
+        result["release_kind"] = "main"
     if str(promoted.get("version") or "").removeprefix("v") != latest:
         return result
     not_before_text = str(promoted.get("not_before") or "")
@@ -382,46 +650,79 @@ def _save_automation_state(value: dict) -> None:
     _write_private_json(_automation_state_path(), value)
 
 
+def _with_automation_check(value: dict) -> dict:
+    """Expose the newest browser/manual or persisted background check time."""
+    state = _read_automation_state()
+    try:
+        checked_at = int(state.get("last_checked_at") or 0)
+    except (TypeError, ValueError):
+        checked_at = 0
+    try:
+        response_checked_at = int(value.get("checked_at") or 0)
+    except (TypeError, ValueError):
+        response_checked_at = 0
+    last_check_at = max(checked_at, response_checked_at)
+    if last_check_at > 0:
+        value["last_check_at"] = last_check_at
+    return value
+
+
 def automation_cycle() -> dict:
     """Run one background release check, notification and gated auto-update decision."""
     from . import config as cfg, notify_push
 
-    info = check(True)
-    result = {"checked": True, "release": info, "notified": False,
+    latest_info = check(True)
+    state = _read_automation_state()
+    state["last_checked_at"] = int(time.time())
+    _save_automation_state(state)
+    result = {"checked": True, "release": latest_info, "notified": False,
               "auto_update_requested": False}
-    if not info.get("update_available"):
+    if not latest_info.get("ok"):
         return result
     settings = cfg.get_settings()
     updates = validate_update_settings(settings.get("updates"))
-    state = _read_automation_state()
-    latest = str(info.get("latest") or "")
+    scope = updates["version_scope"]
     policy = None
     if updates["update_mode"] == "automatic" or updates["version_scope"] == "main":
-        policy = auto_update_authorization(info)
-    in_scope = (updates["version_scope"] == "all"
-                or policy is not None and policy.get("release_kind") == "main")
-    should_notify = (updates["update_mode"] == "notify"
-                     and in_scope)
-    if (should_notify and state.get("notified_version") != latest
+        policy = _load_update_policy(latest_info)
+    latest = str(latest_info.get("latest") or "")
+    target_version = (latest if scope == "all"
+                      else _policy_target(policy, "main", latest))
+    if not target_version:
+        if updates["update_mode"] == "automatic":
+            result["authorization"] = {
+                "authorized": False, "scope": scope,
+                "reason": "policy_unavailable" if policy is None else "not_promoted",
+            }
+        return result
+    info = (latest_info if target_version == latest
+            else check_release(target_version, latest_info.get("network")))
+    result["release"] = info
+    if info is not latest_info:
+        result["latest_release"] = latest_info
+    if not info.get("update_available"):
+        return result
+    target = str(info.get("latest") or "")
+    should_notify = updates["update_mode"] == "notify"
+    if (should_notify and state.get("notified_version") != target
             and notify_push.has_enabled_channel(settings, notify_push.EV_SOFTWARE_UPDATE)):
-        text = f"v{VERSION} → v{latest}\n{info.get('release_url') or ''}".strip()
-        notify_push.dispatch(settings, notify_push.EV_SOFTWARE_UPDATE, {}, latest, text)
-        state["notified_version"] = latest
+        text = f"v{VERSION} → v{target}\n{info.get('release_url') or ''}".strip()
+        notify_push.dispatch(settings, notify_push.EV_SOFTWARE_UPDATE, {}, target, text)
+        state["notified_version"] = target
         state["notified_at"] = int(time.time())
         _save_automation_state(state)
         result["notified"] = True
-    should_auto_update = (updates["update_mode"] == "automatic"
-                          and in_scope)
-    if not should_auto_update or state.get("auto_requested_version") == latest:
+    should_auto_update = updates["update_mode"] == "automatic"
+    if not should_auto_update or state.get("auto_requested_version") == target:
         return result
-    authorization = policy or auto_update_authorization(info)
+    authorization = auto_update_authorization(info, scope=scope, policy=policy)
     result["authorization"] = authorization
     if not authorization.get("authorized"):
         return result
     applied = request_apply(info=info)
     result["apply"] = applied
     if applied.get("ok"):
-        state["auto_requested_version"] = latest
+        state["auto_requested_version"] = target
         state["auto_requested_at"] = int(time.time())
         _save_automation_state(state)
         result["auto_update_requested"] = True
@@ -499,13 +800,20 @@ def cancel_apply() -> dict:
     return {"ok": True}
 
 
-def request_apply(info: dict | None = None) -> dict:
+def request_apply(info: dict | None = None, version: str | None = None) -> dict:
     """Publish a one-click update request for the host orchestrator."""
     status = apply_status()
     if status.get("state") == "running" and not status.get("stale"):
         return {"ok": False, "error": "An update is already in progress",
                 "error_code": "update.error.in_progress", "status": status}
-    info = dict(info) if info is not None else check(True)
+    if version is not None:
+        target = str(version).strip().removeprefix("v")
+        if not re.fullmatch(r"\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?", target):
+            return {"ok": False, "error": "Invalid update version",
+                    "error_code": "update.error.invalid_version"}
+        info = check_release(target, allow_prerelease=True, allow_older=True)
+    else:
+        info = dict(info) if info is not None else check(True)
     if not info.get("update_available"):
         return {"ok": False, "error": info.get("error") or "No update is available",
                 "error_code": info.get("error_code") or "update.error.not_available"}

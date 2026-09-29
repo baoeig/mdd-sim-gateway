@@ -9,14 +9,15 @@
   <a href="#快速安装">快速安装</a> ·
   <a href="docs/ARCHITECTURE.md">架构</a> ·
   <a href="docs/INSTALL.md">安装文档</a> ·
+  <a href="docs/CONTAINER_DEPLOYMENT.md">容器部署</a> ·
   <a href="https://github.com/MddIdd/mdd-sim-gateway/discussions">社区讨论</a>
 </p>
 
-MDD Sim Gateway 是面向 Debian / Ubuntu / Armbian ARM64 设备的自托管多 SIM 通信网关。它将蜂窝模块、USB 读卡器、IMS、EAP-AKA、eSIM、ModemManager 和 sing-box 整合进一个中英文 Web 控制台。
+MDD Sim Gateway 是自托管的多 SIM 通信网关，可以直接安装在 Debian / Ubuntu / Armbian ARM64 主机上，也可以在任何能运行 Docker Compose 的 Linux 主机上以全容器方式运行，包括群晖等 NAS。它将蜂窝模块、USB 读卡器、IMS、EAP-AKA、eSIM、ModemManager 和 sing-box 整合进一个中英文 Web 控制台。
 
 | 真实 SIM 鉴权 | 通话与短信 | 多模块管理 | 独立国家出口 |
 |---|---|---|---|
-| 在物理 SIM/eSIM 内完成 EAP-AKA 与 IMS-AKA，不读取 Ki/OP/OPc | 浏览器软电话、短信收发、通话记录与来电通知 | 统一管理蜂窝模块、PC/SC 读卡器和 eUICC | 为不同 SIM 的 ePDG 路由分配独立国家 TUN，UDP 失败时不泄漏 |
+| 在物理 SIM/eSIM 内完成 EAP-AKA 与 IMS-AKA，不读取 Ki/OP/OPc | 浏览器软电话、短信收发、通话记录与来电通知 | 统一管理蜂窝模块、PC/SC 读卡器和 eUICC | 每张 SIM 的 ePDG 流量走所选国家出口（宿主安装用独立 TUN，全容器用 SOCKS5），出口不通时不泄漏 |
 
 ## 界面导览
 
@@ -26,11 +27,27 @@ MDD Sim Gateway 是面向 Debian / Ubuntu / Armbian ARM64 设备的自托管多 
 
 ## 快速安装
 
+有两种部署方式，功能相同，按宿主机选择：
+
+| | 宿主安装 | 全容器部署 |
+|---|---|---|
+| 适用 | 树莓派等 Debian / Ubuntu / Armbian ARM64 主机 | 任何能运行 Docker Compose 的 amd64/arm64 Linux，包括群晖等 NAS |
+| 宿主上安装什么 | systemd 服务；安装器配置 pcscd、ModemManager、NetworkManager | 除 Docker 外不安装任何项目软件，全部服务都在容器内 |
+| 常驻容器 | 每条线路一个 Engine | Control、Hardware、Egress 三个基础容器，加每条线路一个 Engine |
+| 国家出口 | 每国独立 TUN 与 ePDG 路由 | 每国 SOCKS5 入口，不修改宿主路由表和 DNS |
+| 管理地址 | `https://<网关地址>:8443` | `https://<主机地址>:10443` |
+| 状态 | 正式版 | 正式版，已在群晖 DS1621+ 和树莓派实机验证 |
+
+### 方式一：宿主安装
+
 推荐使用具备 systemd、Docker、USB 和稳定网络的 Debian、Ubuntu 或 Armbian ARM64 主机。
 
-存储要求：根文件系统安装前至少应有 **4 GiB 可用空间**；建议使用 **16 GB 或更大**的系统盘，
-并在升级前保留约 **6 GiB**，以同时容纳新镜像和一代回滚镜像。开发 checkout 或显式源码构建
-还会产生更大的临时构建缓存，不适合空间紧张的设备。虚拟机只扩大虚拟硬盘还不够，必须同步
+存储要求：根文件系统安装前至少应有 **2 GiB 可用空间**；建议使用 **8 GB 或更大**的系统盘，
+并在升级前保留约 **3 GiB**，以同时容纳新镜像和一代回滚镜像。实测占用：Engine 镜像 607 MB，
+两代镜像共享基础层后合计约 676 MB，源码 checkout 与虚拟环境约 102 MB；Docker 控制面模式
+另需 355 MB。**显式源码构建是例外**——在设备上编译 Asterisk 需要额外数 GiB 的构建缓存与
+中间产物，与上述数字无关，不适合空间紧张的设备（正常安装与升级都直接下载 CI 构建的镜像，
+不会走这条路径）。虚拟机只扩大虚拟硬盘还不够，必须同步
 扩展根分区和文件系统，并以 `df -h /` 显示的容量为准。
 
 ```bash
@@ -40,6 +57,30 @@ sudo ./install.sh install
 ```
 
 安装完成后访问 `https://<网关地址>:8443`，并在受信的局域网或 VPN 中立即创建管理员账号。完整的前置检查、安装过程和升级方式见 [安装与升级](docs/INSTALL.md)。
+
+### 方式二：全容器部署（Docker Compose）
+
+除 Docker 外不在宿主上安装任何项目软件，也不需要运行安装脚本。宿主需要是 Linux：Docker Desktop
+（macOS/Windows）无法把 USB 设备交给容器，不能使用；rootless Docker 也不支持。
+
+1. **确认宿主已识别蜂窝模块。**插入模块后宿主应出现 `/dev/ttyUSB*`、`/dev/cdc-wdm*` 和
+   `wwan*` 网卡；普通 PC/SC 读卡器只需出现在 `/dev/bus/usb`。节点缺失说明宿主缺少内核驱动，
+   主流发行版内核一般自带所需驱动；群晖等精简内核可能缺失，DS1621+ 可使用随 Release 发布的驱动包，
+   见 [兼容性与驱动目录](drivers/README.md)。
+   宿主若已运行 ModemManager（Ubuntu 等发行版默认启用），先停用，否则它会和容器抢占模块。
+2. **下载 Compose 文件。**从 [Releases](https://github.com/MddIdd/mdd-sim-gateway/releases) 下载
+   `mdd-sim-gateway-compose-vX.Y.Z.yaml`，四个镜像已固定为该版本。
+3. **修改文件开头标出的两项。**`MDD_ADVERTISE_ADDR` 改成主机的局域网地址（浏览器通话的媒体
+   地址）；数据目录改成你的实际路径，文件中的 `/volume1/docker/mdd-sim-gateway` 是群晖的示例。
+   管理端口默认 `10443`。
+4. **启动。**普通 Linux 把文件保存为数据目录下的 `docker-compose.yml`，在该目录执行
+   `docker compose up -d`；群晖在 Container Manager 中新建项目并粘贴 YAML。
+5. **打开 `https://<主机地址>:10443`**，立即创建管理员账号。
+
+启动或重建 Hardware 时，它可能要先重置一次蜂窝模块，约一到两分钟后才变为健康，属于正常现象。四个镜像
+解压后每代约 1.3 GB，一键更新时新旧两代并存，请为 Docker 存储保留至少 6 GiB。更新、回滚和
+问题排查见 [全容器部署指南](docs/CONTAINER_DEPLOYMENT.md)。目前实机验证过的是群晖 DS1621+，
+其他主机的验证记录会补充到 [兼容性目录](drivers/README.md)。
 
 > 本项目直接控制蜂窝模块、SIM、网络路由和 IMS。运营商是否开放 Wi‑Fi Calling 仍取决于套餐、区域、设备身份和网络策略。
 
@@ -71,13 +112,18 @@ sudo ./install.sh install
 - 自动识别蜂窝模块与普通 PC/SC 读卡器；模块可同时管理 4G 和 VoWiFi，读卡器仅显示其支持的 VoWiFi 能力。
 - 每个物理模块独立保存 4G、飞行模式和 VoWiFi 期望状态：4G 开关只控制移动数据承载，飞行模式单独控制射频，VoWiFi 独立启停；状态按各自 ModemManager 对象读取。
 - 在“余额与保号”页统一查看余额、套餐到期、在线状态和保号结果；预付费线路可定时发送一条真实计费短信，套餐线路可监测续费余额并在不足时提醒。
-- 后台每 6 小时检查新版本；可选择自动更新或仅提示更新，并将范围设为主版本或全部版本。无人值守安装仍须由 `update-policy.json` 明确许可具体版本和最早执行时间。
+- 后台每 6 小时检查新版本；可选择自动更新或仅提示更新。“全部版本”跟随获准推送的最新 Release，“仅主版本”跟随独立配置的稳定主版本，即使已有更新补丁也能补装该主版本。无人值守安装仍须由 `update-policy.json` 明确许可具体版本和最早执行时间。
 - 使用物理 SIM/eSIM 完成 EAP-AKA 与 IMS-AKA；不读取、不保存 Ki/OP/OPc，也不使用演示鉴权向量。
+- DITO Telecommunity（515-66）使用该 ePDG 公布的 AES-CBC-128/HMAC-SHA1/MODP-1024
+  IKE 套件；该旧套件仅作用于该 PLMN，其他运营商仍使用现有的 MODP-2048 强套件。
+- 按 RFC 4187 响应 EAP-AKA 的永久/完整身份请求，兼容要求此标准身份流程的运营商。
 - 自动读取 IMSI、ICCID、MCC/MNC、SIM SPN/GID 和模块 IMEI；使用内置 AOSP Carrier ID 数据离线识别宿主网络与部分 MVNO，PIN 开启时仅在本机加密边界内使用。
 - 每张模块 SIM 显式展示三条逻辑通道的容量、实际分配、用途和错误；部分分配失败会主动释放已打开通道。
-- 登录后使用的浏览器软电话、短信收发、通话记录、未接来电通知和可按线路启用的本地语音留言；录音只保存在网关，不随通知或支持包发送；不开放独立 SIP 客户端接入。
+- 登录后使用的浏览器软电话、短信与彩信收发、通话记录、未接来电通知和可按线路启用的本地语音留言；录音只保存在网关，不随通知或支持包发送；不开放独立 SIP 客户端接入。
 - 可建立包含多个订阅、具体节点和 SOCKS5 的代理库，再为国家出口复用其中一项；Reality/XHTTP 节点由 Xray-core 兼容层承载，其余节点与国家 TUN 由 sing-box 管理。候选节点必须通过 UDP 健康检查，失败时按 SIM 故障关闭，不泄漏到错误国家。
-- 标准 GET/POST Webhook、Telegram（直连/手动代理/国家出口）和 PushPlus。
+- 标准 GET/POST Webhook、Telegram（直连/手动代理/国家出口）、PushPlus 和多个飞书/Lark
+  自定义机器人（支持可选签名校验及按 SIM 线路路由）；四类通道都可按
+  事件自定义标题与正文模板，并提供预览及对应事件的测试推送。
 - Telegram 仅用于单向推送来电、短信和设备状态通知，不接受远程控制指令。
 - 使用 lpac 管理 eUICC 配置文件；支持需要显式选择安全元件的双 SE 卡。
 - 中英文界面、HTTPS、首次管理员设置、可持久化的 12 小时或 30 天会话登录、CSRF、防暴力登录、审计记录、脱敏支持包、备份与版本检查。
@@ -88,6 +134,7 @@ sudo ./install.sh install
 |---|---:|---:|---|
 | 支持 ModemManager 的蜂窝模块 | ✓ | ✓ | 模块 AT/逻辑通道桥接 |
 | 大疆/Quectel EC25 类模块 | ✓ | ✓ | 自动识别并创建所需虚拟读卡通道 |
+| Quectel EC20（`05c6:9215`） | 未验证 | ✓（用户实测） | 自动识别并创建所需虚拟读卡通道 |
 | USB PC/SC 读卡器 | — | ✓ | 直接 PC/SC |
 | 三体电子 SCR Prime（`04d9:c001`） | — | ✓ | 直接 PC/SC；安装时使用 `patchprime` 驱动补丁 |
 | eUICC/eSIM 读卡器 | — | ✓ | PC/SC + lpac |
@@ -97,7 +144,7 @@ sudo ./install.sh install
 
 ## 安装器会做什么
 
-安装脚本会自动：
+以下只适用于宿主安装；全容器部署不运行安装脚本。安装脚本会自动：
 
 1. 检查并复用现有系统 Docker（没有时才从发行版安装），安装 pcscd、ModemManager/NetworkManager；
 2. 按架构下载 sing-box 1.13.15 与 Xray-core 26.3.27 并验证 SHA-256；
@@ -121,7 +168,7 @@ sudo ./install.sh uninstall
 
 ## 使用边界
 
-> **合规警告：** 本软件仅供号码实名持有人在运营商明确允许的范围内自用。严禁用于诈骗、群呼、营销骚扰、验证码接收、号码或线路出租、代拨转接、隐藏实际控制地点，或向第三人提供电信服务。使用者必须遵守所在地法律、电话实名制和运营商协议；本项目不构成任何电信业务许可或运营商授权。MDD Sim Gateway 最多保存和运行 **5 条 SIM 线路**，不提供独立 SIP 账号或 Telegram 远程拨号、发短信及挂断功能。技术限制不代表某种使用方式当然合法。
+> **合规警告：** 本软件仅供号码实名持有人在运营商明确允许的范围内自用。严禁用于诈骗、群呼、营销骚扰、验证码接收、号码或线路出租、代拨转接、隐藏实际控制地点，或向第三人提供电信服务。使用者必须遵守所在地法律、电话实名制和运营商协议；本项目不构成任何电信业务许可或运营商授权。MDD Sim Gateway 最多保存和运行 **10 条 SIM 线路**，不提供独立 SIP 账号或 Telegram 远程拨号、发短信及挂断功能。技术限制不代表某种使用方式当然合法。
 
 ## 社区与反馈
 

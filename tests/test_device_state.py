@@ -274,6 +274,183 @@ bearer.stats.tx-bytes : 456
             self.assertEqual(value["msisdn"], "+12025550100")
             self.assertEqual(value["sim_iccid"], "8901000000000000001")
 
+    def _orchestrator_calls(self, method, snapshot, *, exists=True, active=(), **kwargs):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=False)
+            calls = []
+
+            def fake_run(args, **_kwargs):
+                calls.append(args)
+                if args[:3] == ["nmcli", "connection", "show"] and len(args) == 4:
+                    return SimpleNamespace(returncode=0 if exists else 1, stdout="", stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.object(app, "_active_gsm_profiles", return_value=list(active)), patch(
+                    "host.mdd_orchestrator.run", side_effect=fake_run):
+                getattr(app, method)(snapshot, **kwargs) if method == "disconnect_modem_data" \
+                    else getattr(app, method)({"id": "modem-a"}, snapshot)
+            return calls, app
+
+    def test_a_modem_profile_never_autoconnects_or_carries_the_default_route(self):
+        """A modem is plugged in to have its SIM read. If NetworkManager dials it on its own
+        and the result becomes the default route, the VoWiFi tunnel authenticating that very
+        SIM leaves through that SIM's own carrier."""
+        policy = Orchestrator.modem_profile_policy()
+        self.assertEqual(policy[policy.index("connection.autoconnect") + 1], "no")
+        self.assertEqual(policy[policy.index("ipv4.never-default") + 1], "yes")
+        self.assertEqual(policy[policy.index("ipv6.never-default") + 1], "yes")
+
+    def test_the_default_route_guard_is_released_for_a_modem_only_uplink(self):
+        with patch.object(mdd_orchestrator, "MODEM_MAY_PROVIDE_DEFAULT_ROUTE", True):
+            policy = Orchestrator.modem_profile_policy()
+        # The switch is about the default route only: autoconnect stays off either way,
+        # because the orchestrator owns the desired state and brings the profile up itself.
+        self.assertEqual(policy[policy.index("connection.autoconnect") + 1], "no")
+        self.assertNotIn("ipv4.never-default", policy)
+        self.assertNotIn("ipv6.never-default", policy)
+
+    def test_a_new_cellular_profile_is_created_with_the_policy(self):
+        snapshot = {"powered": True, "data_active": False, "registration": "roaming",
+                    "primary_port": "ttyUSB5", "apn": "ims",
+                    "profile": Orchestrator.cellular_profile_name("modem-a")}
+        calls, _app = self._orchestrator_calls("ensure_modem_data", snapshot, exists=False)
+        add = next(call for call in calls if call[:3] == ["nmcli", "connection", "add"])
+        self.assertEqual(add[add.index("connection.autoconnect") + 1], "no")
+        self.assertEqual(add[add.index("ipv4.never-default") + 1], "yes")
+
+    def test_the_first_dial_is_not_held_back_on_a_freshly_booted_host(self):
+        """The 45-second limit stored "never attempted" as monotonic zero, so on a host up
+        for less than 45 seconds the first dial was skipped."""
+        snapshot = {"powered": True, "data_active": False, "registration": "home",
+                    "primary_port": "ttyUSB5", "apn": "internet",
+                    "profile": Orchestrator.cellular_profile_name("modem-a")}
+        with patch("host.mdd_orchestrator.time.monotonic", return_value=5.0):
+            calls, _app = self._orchestrator_calls("ensure_modem_data", snapshot, exists=False)
+        self.assertTrue(any(call[:3] == ["nmcli", "connection", "up"] for call in calls))
+
+    def test_an_existing_legacy_profile_is_corrected_even_without_an_apn(self):
+        """Profiles written by an older version carry autoconnect=yes and no route guard, and
+        they outlive the upgrade. Correcting them only when an APN was known left them."""
+        snapshot = {"powered": True, "data_active": False, "registration": "home",
+                    "primary_port": "ttyUSB5", "apn": "",
+                    "profile": Orchestrator.cellular_profile_name("modem-a")}
+        calls, _app = self._orchestrator_calls("ensure_modem_data", snapshot, exists=True)
+        modify = next(call for call in calls if call[:3] == ["nmcli", "connection", "modify"])
+        self.assertEqual(modify[modify.index("connection.autoconnect") + 1], "no")
+        self.assertEqual(modify[modify.index("ipv4.never-default") + 1], "yes")
+
+    def test_disabling_data_reaches_a_profile_whose_modem_reports_no_port(self):
+        """A modem in a failed or SIM-less state reports no primary port. Matching only on the
+        port found nothing to do in exactly the state where an autoconnecting profile is most
+        likely to dial on its own."""
+        snapshot = {"profile": "mdd-cell-legacy", "primary_port": "", "network_interface": ""}
+        calls, app = self._orchestrator_calls(
+            "disconnect_modem_data", snapshot, active=[("mdd-cell-legacy", "wwan0")])
+        modify = next(call for call in calls if call[:3] == ["nmcli", "connection", "modify"])
+        self.assertEqual(modify[3], "mdd-cell-legacy")
+        self.assertEqual(modify[modify.index("connection.autoconnect") + 1], "no")
+        self.assertIn(["nmcli", "connection", "down", "mdd-cell-legacy"], calls)
+        self.assertIn("mdd-cell-legacy", app.modem_profile_policed)
+
+    def test_a_policed_profile_is_not_rewritten_on_every_reconcile(self):
+        """Data-off runs on every cycle. Rewriting settings that already say what we want was
+        the largest avoidable source of process creation in the old proposal for this fix."""
+        snapshot = {"profile": "mdd-cell-legacy", "primary_port": "", "network_interface": ""}
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=False)
+            calls = []
+
+            def fake_run(args, **_kwargs):
+                calls.append(args)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.object(app, "_active_gsm_profiles", return_value=[]), patch(
+                    "host.mdd_orchestrator.run", side_effect=fake_run):
+                app.disconnect_modem_data(dict(snapshot))
+                first = len(calls)
+                for _ in range(5):
+                    app.disconnect_modem_data(dict(snapshot))
+        self.assertEqual(len([c for c in calls if c[:3] == ["nmcli", "connection", "modify"]]), 1)
+        self.assertLess(len(calls) - first, first * 5)
+
+    def _sweep(self, listing, returncode=0):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=False)
+            calls = []
+
+            def fake_run(args, **_kwargs):
+                calls.append(args)
+                if args[:2] == ["nmcli", "-t"]:
+                    return SimpleNamespace(returncode=returncode, stdout=listing, stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("host.mdd_orchestrator.run", side_effect=fake_run):
+                app.police_orphaned_modem_profiles()
+                app.police_orphaned_modem_profiles()
+            return calls, app
+
+    def test_a_leftover_profile_is_secured_when_cellular_is_simply_turned_off(self):
+        """Every data path is gated on the cellular backend being up, so turning cellular data
+        off -- ModemManager stood down, the GSM profile left behind -- is the one state where
+        nothing corrects a profile that still says autoconnect forever."""
+        listing = ("Wired connection 1:802-3-ethernet\n"
+                   "mdd-cell-0a05dad4d32d:gsm\n")
+        calls, app = self._sweep(listing)
+        modify = [call for call in calls if call[:3] == ["nmcli", "connection", "modify"]]
+        self.assertEqual(len(modify), 1, "swept once per stand-down, not per cycle")
+        self.assertEqual(modify[0][3], "mdd-cell-0a05dad4d32d")
+        self.assertEqual(modify[0][modify[0].index("connection.autoconnect") + 1], "no")
+        self.assertEqual(modify[0][modify[0].index("ipv4.never-default") + 1], "yes")
+        self.assertIn("mdd-cell-0a05dad4d32d", app.modem_profile_policed)
+
+    def test_the_sweep_leaves_connections_it_does_not_own_alone(self):
+        listing = ("Wired connection 1:802-3-ethernet\n"
+                   "some-other-modem:gsm\n"
+                   "mdd-cell-keep:bridge\n")
+        calls, _app = self._sweep(listing)
+        self.assertEqual([c for c in calls if c[:3] == ["nmcli", "connection", "modify"]], [])
+
+    def test_an_unreadable_connection_list_is_retried_rather_than_swallowed(self):
+        calls, app = self._sweep("", returncode=1)
+        self.assertFalse(app.modem_profiles_swept)
+        self.assertEqual(len([c for c in calls if c[:2] == ["nmcli", "-t"]]), 2)
+
+    def test_unreadable_sim_iccid_is_not_reported_as_an_identity(self):
+        """mmcli prints "--" for a property it could not read. Passed through, the control
+        plane treats it as a live ICCID that matches no line and never falls through to the
+        PC/SC bridge, which can still read the card over a logical channel."""
+        self.assertEqual(Orchestrator.normalize_iccid("--"), "")
+        self.assertEqual(Orchestrator.normalize_iccid("unknown"), "")
+        self.assertEqual(Orchestrator.normalize_iccid(""), "")
+        self.assertEqual(Orchestrator.normalize_iccid("8901000000000000001"),
+                         "8901000000000000001")
+        # Not an ICCID: wrong issuer prefix, or too short to be one.
+        self.assertEqual(Orchestrator.normalize_iccid("1234567890123456789"), "")
+        self.assertEqual(Orchestrator.normalize_iccid("890100000"), "")
+
+    def test_snapshot_drops_a_placeholder_sim_iccid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp) / "data", Path(temp), dry_run=False)
+            modem_detail = """modem.generic.primary-port : cdc-wdm1
+modem.generic.sim : /org/freedesktop/ModemManager1/SIM/1
+modem.generic.state : connected
+modem.generic.power-state : on
+"""
+
+            def fake_run(args, **_kwargs):
+                if args[:2] == ["mmcli", "-m"]:
+                    return SimpleNamespace(returncode=0, stdout=modem_detail, stderr="")
+                if args[:2] == ["mmcli", "-i"]:
+                    return SimpleNamespace(returncode=0,
+                                           stdout="sim.properties.iccid : --\n", stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.object(app, "modemmanager_modem_for_tty",
+                              return_value="/org/freedesktop/ModemManager1/Modem/4"), patch(
+                                  "host.mdd_orchestrator.run", side_effect=fake_run):
+                value = app.modem_snapshot({"id": "modem-c", "tty": "/dev/ttyUSB7"})
+        self.assertEqual(value["sim_iccid"], "")
+
     def test_modem_number_normalization_rejects_placeholders_and_status_text(self):
         self.assertEqual(Orchestrator.normalize_msisdn("--"), "")
         self.assertEqual(Orchestrator.normalize_msisdn("not available"), "")
@@ -335,6 +512,7 @@ modem.3gpp.registration-state : unknown
         def __init__(self, command):
             self.command = command
             self.running = True
+            self.pid = 7
 
         def poll(self):
             return None if self.running else 0
@@ -386,6 +564,64 @@ modem.3gpp.registration-state : unknown
             self.assertIs(app.bridges["b"], bridge_b)
             self.assertTrue(bridge_a.running)
 
+    def test_host_diagnostics_reports_only_bridge_identity_health(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            modem = {"id": "a", "name": "A", "tty": "/dev/a"}
+            assignments = {"a": {**modem, "base_port": 15360}}
+            app.bridges["a"] = self.Process(["bridge"])
+            app._bridge_commands["a"] = ["bridge"]
+            metadata = app.data / "modems" / "a.json"
+            metadata.parent.mkdir(parents=True)
+            metadata.write_text(json.dumps({
+                "updated_at": int(time.time()) - 12,
+                "imei": "123456789012345", "iccid": "8944000000000000000",
+                "channel_status": "ready", "channel_requested": 3,
+                "channel_allocated": 3,
+            }))
+            with patch.object(app, "virtualization", return_value="kvm"), \
+                    patch.object(app, "vpcd_port_status", return_value={}), \
+                    patch.object(app, "reader_definitions_listing", return_value=[]):
+                app.publish_host_diagnostics([modem], assignments, False, False, True)
+
+            document = device_state._read(str(app.host_diagnostics_path), {})
+            bridge = document["bridges"]["a"]
+
+        self.assertTrue(bridge["imei_valid"])
+        self.assertTrue(bridge["iccid_valid"])
+        self.assertTrue(bridge["channels_ready"])
+        self.assertGreaterEqual(bridge["metadata_age_seconds"], 12)
+        self.assertNotIn("123456789012345", json.dumps(bridge))
+        self.assertNotIn("8944000000000000000", json.dumps(bridge))
+
+    def test_bad_bridge_metadata_is_bounded_instead_of_crashing_publish(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            modem = {"id": "a", "name": "A", "tty": "/dev/a"}
+            assignments = {"a": {**modem, "base_port": 15360}}
+            app.bridges["a"] = self.Process(["bridge"])
+            metadata = app.data / "modems" / "a.json"
+            metadata.parent.mkdir(parents=True)
+            metadata.write_text(json.dumps({
+                "updated_at": "not-a-number", "imei": "123456789012345",
+                "iccid": "89" + "0" * 20, "channel_status": "ready",
+                "channel_requested": {}, "channel_allocated": "nan",
+            }))
+            with patch.object(app, "virtualization", return_value="kvm"), \
+                    patch.object(app, "vpcd_port_status", return_value={}), \
+                    patch.object(app, "reader_definitions_listing", return_value=[]):
+                app.publish_host_diagnostics([modem], assignments, False, False, True)
+
+            bridge = device_state._read(str(app.host_diagnostics_path), {})["bridges"]["a"]
+
+        self.assertIsNone(bridge["metadata_age_seconds"])
+        self.assertTrue(bridge["iccid_valid"])
+        self.assertFalse(bridge["channels_ready"])
+
     def test_unplugging_a_modem_stops_only_its_bridge(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -427,6 +663,37 @@ modem.3gpp.registration-state : unknown
             # pcsc-lite skips dot files, so the definition is only parked, not destroyed.
             self.assertIn("Virtual PCD", config.with_name(".vpcd.mdd-disabled").read_text())
             self.assertNotIn("0x8C7B", config.read_text())
+
+    def test_reader_definitions_stay_readable_by_an_unprivileged_pcscd(self):
+        """The service's UMask=0077 made the file 0600 root, which a pcscd that runs as
+        its own user (Ubuntu 26.04) skips — the host then shows no modem reader at all."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = Orchestrator(root / "data", root, dry_run=False)
+            app.root.mkdir(parents=True)
+            modems = [{"id": "a", "name": "A", "tty": "/dev/a"}]
+            desired = {"a": {"vowifi_enabled": True}}
+            config = root / "readers.conf"
+            previous = os.umask(0o077)
+            try:
+                self.reconcile(app, modems, desired, config)
+            finally:
+                os.umask(previous)
+            self.assertEqual(config.stat().st_mode & 0o777, 0o644)
+
+            # A file an earlier release left at 0600 already holds the right content, so
+            # only its mode can prompt the repair — and pcscd must re-read it afterwards.
+            os.chmod(config, 0o600)
+            with patch("host.mdd_orchestrator.run",
+                       return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run, \
+                    patch.object(app, "usb_modems", return_value=modems), \
+                    patch("host.mdd_orchestrator.subprocess.Popen",
+                          side_effect=lambda command, **kwargs: self.Process(command)), \
+                    patch.dict("os.environ", {"MDD_VPCD_READER_CONFIG": str(config)}):
+                app.reconcile_hardware({"hardware": {"auto_detect": True, "vpcd_slots": 3}},
+                                       desired)
+            self.assertEqual(config.stat().st_mode & 0o777, 0o644)
+            run.assert_any_call(["systemctl", "restart", "pcscd.service"])
 
     def test_a_port_saved_on_the_vpcd_default_is_migrated_away(self):
         with tempfile.TemporaryDirectory() as temp:

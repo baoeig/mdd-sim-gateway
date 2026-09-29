@@ -71,6 +71,8 @@ ENGINE_IMAGE="mdd-sim-gateway/engine"
 ENGINE_HANDOFF_MANIFEST="$REPO_DIR/engine/release-image.SHA256SUMS"
 CONTROL_NAME="mdd-sim-gateway-control"
 ENGINE_PREFIX="mdd-sim-gateway-engine-"
+RELAY_NAME="mdd-sim-gateway-relay"
+MEDIA_NETWORK="mdd-sim-gateway-media"
 MDD_DOCKER_LABEL="io.mdd-sim-gateway.managed"
 WEBUI_BUILD_IMAGE="node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32"
 
@@ -117,9 +119,13 @@ VPCD_SLOTS="${VPCD_SLOTS:-4}"
 SINGBOX_VERSION="${MDD_SINGBOX_VERSION:-1.13.15}"
 SINGBOX_SHA256_AMD64="a3a3ff223b23c3f4731d0a17cb0ef94c97ce257c70721a5b07dc7ca079203c9f"
 SINGBOX_SHA256_ARM64="f0810bbb5722ae36635687c421019defcc8b328d31a0b3c287901f331747ca93"
+# 26.3.27 is the newest release Xray marks stable; everything after it is a prerelease.
+# REALITY moves with Xray, so an operator whose server runs a prerelease may need to match
+# it here. Overriding the version alone would only fail the checksum of the pinned one, so
+# the digests are overridable together with it — a reviewed override, never a silent one.
 XRAY_VERSION="${MDD_XRAY_VERSION:-26.3.27}"
-XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
-XRAY_SHA256_ARM64="4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c"
+XRAY_SHA256_AMD64="${MDD_XRAY_SHA256_AMD64:-23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae}"
+XRAY_SHA256_ARM64="${MDD_XRAY_SHA256_ARM64:-4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c}"
 LPAC_VERSION="${MDD_LPAC_VERSION:-2.3.0}"
 LPAC_COMMIT="c2fcf5e4b21c712d54e35a11da2ad9ad134fb821"
 CMAKE_SHA256_AMD64="0dc2e9a6860f06bf10bd8fadc03e35d9eeb4df46e33763a7e480e987758f385c"
@@ -209,13 +215,62 @@ ensure_xray() {
 }
 
 ensure_cellular_tools() {
-  if have apt-get; then pkg_install modemmanager network-manager dbus
-  elif have dnf || have yum; then pkg_install ModemManager NetworkManager dbus
-  elif have pacman; then pkg_install modemmanager networkmanager dbus
+  if have apt-get; then pkg_install modemmanager network-manager mobile-broadband-provider-info dbus
+  elif have dnf || have yum; then pkg_install ModemManager NetworkManager mobile-broadband-provider-info dbus
+  elif have pacman; then pkg_install modemmanager networkmanager mobile-broadband-provider-info dbus
   fi
   have mmcli || die "ModemManager command mmcli is unavailable"
   have nmcli || die "NetworkManager command nmcli is unavailable"
   ensure_modemmanager_command_interface
+  ensure_mms_at_port_rule
+}
+
+# Sending MMS through a modem's embedded TCP/IP stack needs an AT port the gateway owns:
+# through ModemManager's command channel the module's upload command never completes, so each
+# chunk waits out a timeout, and a run of them makes ModemManager drop the modem. This rule
+# releases only a port ModemManager itself classifies as a Quectel module's *secondary* AT
+# port; the primary AT port and QMI/MBIM stay with ModemManager, and a module with a single
+# AT port has no secondary one to match.
+MMS_AT_PORT_RULE="${MDD_UDEV_RULES_DIR:-/etc/udev/rules.d}/78-mdd-mms-at-port.rules"
+
+# Re-evaluate tty udev properties and let ModemManager re-probe with them. Both are needed: a
+# changed rules file only reaches the udev database on the next event for the device, and
+# ModemManager reads ID_MM_PORT_IGNORE when it probes a port.
+reapply_modem_port_rules() {
+  if have udevadm; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --action=change --subsystem-match=tty 2>/dev/null || true
+    udevadm settle --timeout=10 2>/dev/null || true
+  fi
+  if have systemctl && systemctl is-active ModemManager.service >/dev/null 2>&1; then
+    systemctl restart ModemManager.service
+  fi
+}
+
+ensure_mms_at_port_rule() {
+  [ -d "$(dirname "$MMS_AT_PORT_RULE")" ] || return 0
+  rule_file=$MMS_AT_PORT_RULE
+  temporary=$(mktemp /tmp/mdd-udev.XXXXXX)
+  cat >"$temporary" <<'RULE'
+# MDD Sim Gateway: let the gateway own a Quectel module's secondary AT port for MMS uploads.
+# ModemManager keeps the primary AT port and QMI; a module with a single AT port is unaffected.
+ACTION!="remove", SUBSYSTEM=="tty", ATTRS{idVendor}=="2c7c", ENV{ID_MM_PORT_TYPE_AT_SECONDARY}=="1", ENV{ID_MM_PORT_IGNORE}="1"
+RULE
+  if [ ! -f "$rule_file" ] || ! cmp -s "$temporary" "$rule_file"; then
+    install -m 0644 "$temporary" "$rule_file"
+    info "releasing the modem's secondary AT port for MMS (ModemManager restarts)…"
+    reapply_modem_port_rules
+  fi
+  rm -f "$temporary"
+}
+
+# Uninstall: give the port back. Removing the file alone would leave ID_MM_PORT_IGNORE in the
+# udev database, and the port ignored, until the next reboot.
+remove_mms_at_port_rule() {
+  [ -f "$MMS_AT_PORT_RULE" ] || return 0
+  rm -f "$MMS_AT_PORT_RULE"
+  info "returning the modem's secondary AT port to ModemManager (ModemManager restarts)…"
+  reapply_modem_port_rules
 }
 
 # The module SIM bridge sends APDUs through ModemManager's guarded AT command API.  Upstream
@@ -727,9 +782,9 @@ handoff_release_images() {
 prepare_release_images() {
   [ "${MDD_BUILD_IMAGES:-0}" != 1 ] || {
     info "building images from source (MDD_BUILD_IMAGES=1)"
-    return
+    return 0
   }
-  [ -f "$ENGINE_HANDOFF_MANIFEST" ] || return
+  [ -f "$ENGINE_HANDOFF_MANIFEST" ] || return 0
   have python3 || die "python3 is required to import Release image assets"
   MDD_REUSE_WEBUI=1
   MDD_PRUNE_BUILD_CACHE=1
@@ -737,13 +792,13 @@ prepare_release_images() {
   if engine_matches_checkout; then
     if [ "$MODE" = local ]; then
       info "installed Engine already matches the official release — reusing images"
-      return
+      return 0
     fi
     if control_image_matches_checkout; then
       MDD_REUSE_CONTROL_IMAGE=1
       export MDD_REUSE_CONTROL_IMAGE
       info "installed Engine and Control already match the official release — reusing images"
-      return
+      return 0
     fi
   fi
   version=$(tr -d '\n' < "$REPO_DIR/VERSION")
@@ -885,8 +940,16 @@ setup_venv() {
     info "control requirements already satisfied — reusing the installed packages"
   else
     "$VENV_DIR/bin/python" -m pip install --quiet wheel \
-      -r "$REPO_DIR/control/requirements.txt"
+      -r "$REPO_DIR/control/requirements.txt" \
+      || die "installing the control requirements failed; nothing has been restarted. An offline host needs the wheels available first."
   fi
+  # Installed is not the same as usable: Pillow and pi-heif carry native libraries, and
+  # the control plane deliberately starts without them -- MMS picture conversion then simply
+  # stops, which nobody notices until a photo is sent. A reload must not leave the gateway in
+  # that state, so prove the venv imports what the control plane needs before it is restarted.
+  # Add to this list when a dependency brings native code of its own.
+  "$VENV_DIR/bin/python" -c "import PIL.Image, pi_heif" >/dev/null 2>&1 \
+    || die "the control requirements install but do not import (Pillow/pi-heif); nothing has been restarted."
   info "venv ready"
 }
 
@@ -1105,6 +1168,29 @@ remove_orchestrator() {
 }
 
 # ------------------------------------------------------------------ containerized control plane
+# SWU_TUN_MTU fixes the engines' ipsec0 MTU for a carrier that drops fragments; the control plane
+# hands it to every engine it starts. A native install keeps it in a systemd drop-in, which a
+# reload leaves alone. The docker-mode control container is recreated on every reload, so take
+# the value from the installer's environment, else from the container being replaced: an update
+# must not silently put the engines back on the default. SWU_TUN_MTU=default drops a carried-over
+# value. Anything outside 1280-1500 is ignored: below 1280 the kernel takes IPv6 off ipsec0,
+# which an IPv6 PDN needs, and above 1500 the ESP packets cannot fit a normal uplink.
+control_tun_mtu() {
+  value="${SWU_TUN_MTU:-}"
+  [ "$value" = default ] && return 0
+  [ -n "$value" ] || value=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' \
+    "$CONTROL_NAME" 2>/dev/null | sed -n 's/^SWU_TUN_MTU=//p' | head -n 1)
+  case "$value" in
+    '') ;;
+    *[!0-9]*) warn "ignoring SWU_TUN_MTU=$value (not a number)" >&2 ;;
+    *) if [ "${#value}" -le 4 ] && [ "$value" -ge 1280 ] && [ "$value" -le 1500 ]; then
+         printf '%s' "$value"
+       else
+         warn "ignoring SWU_TUN_MTU=$value (outside 1280-1500)" >&2
+       fi ;;
+  esac
+}
+
 run_control() {
   install -d -m 0700 "$MDD_DATA_DIR"
   DATA_ABS=$(data_dir_abs)
@@ -1112,6 +1198,7 @@ run_control() {
   [ -z "$LAN_IP" ] && LAN_IP=$(detect_lan_ip)
   [ -z "$LAN_IP" ] && warn "could not auto-detect a LAN IP; set MDD_ADVERTISE_ADDR — SIP/WebRTC audio needs a routable host address"
 
+  TUN_MTU=$(control_tun_mtu)
   if docker inspect "$CONTROL_NAME" >/dev/null 2>&1; then
     docker_container_owned "$CONTROL_NAME" || die "refusing to replace foreign container '$CONTROL_NAME'"
     docker rm -f "$CONTROL_NAME" >/dev/null
@@ -1138,6 +1225,7 @@ run_control() {
     -e MDD_MANAGER_URL="https://host.docker.internal:${MDD_PORT}" \
     -e MDD_ENGINE_IMAGE="${ENGINE_IMAGE}" \
     -e MDD_PCSCD_DIR=/run/pcscd \
+    ${TUN_MTU:+-e SWU_TUN_MTU=$TUN_MTU} \
     -e MDD_SINGBOX_BIN=/usr/local/bin/sing-box \
     -e MDD_XRAY_BIN=/usr/local/bin/xray \
     "$CONTROL_IMAGE"
@@ -1268,6 +1356,11 @@ cmd_reload() {
   else
     ensure_engine_image
   fi
+  # Only a gateway in relay media mode needs the relay image. Failing to fetch this version's
+  # keeps the one in use: the update itself is not held back by an optional component.
+  if [ "$(media_mode_recorded)" = relay ]; then
+    ensure_relay_image
+  fi
   if [ "$MODE" = docker ]; then
     setup_venv
     build_control_image
@@ -1314,6 +1407,68 @@ cmd_reload() {
   # not be reported as failed only because optional disk cleanup could not run.
   cleanup_release_artifacts
   info "reload complete (data preserved)"
+}
+
+# ------------------------------------------------------------------ media mode
+# How call media reaches the lines: direct (each line publishes its RTP ports, the default) or
+# relay (one TURN relay port, nothing published by the engines). control/app/media.py does the
+# work; this runs it in the control plane's own environment and supplies the relay image.
+relay_image_ref() {
+  printf 'mdd-sim-gateway/relay:v%s' "$(tr -d '\n' < "$REPO_DIR/VERSION")"
+}
+
+media_mode_recorded() {
+  grep -q '"mode": "relay"' "$MDD_DATA_DIR/media/state.json" 2>/dev/null && echo relay || echo direct
+}
+
+# The relay is upstream coturn, unmodified (control/app/media.py pins it). An official release
+# ships it as a checksummed asset: import that here the way the other images are imported, so a
+# host that cannot reach Docker Hub still gets it. A checkout without the release manifest, or a
+# failed download, leaves it to the control plane, which then tries the release's registry and
+# upstream itself.
+ensure_relay_image() {
+  ref=$(relay_image_ref)
+  docker image inspect "$ref" >/dev/null 2>&1 && return 0
+  [ -f "$ENGINE_HANDOFF_MANIFEST" ] && grep -q "mdd-sim-gateway-relay-" "$ENGINE_HANDOFF_MANIFEST" \
+    && have python3 || return 0
+  set -- python3 "$REPO_DIR/host/mdd_update.py" --repo "$REPO_DIR" --data "$MDD_DATA_DIR" \
+    --version "$(tr -d '\n' < "$REPO_DIR/VERSION")" \
+    --repository "${MDD_UPDATE_REPOSITORY:-MddIdd/mdd-sim-gateway}" --install-relay-image
+  [ -f "$MDD_DATA_DIR/update/network.json" ] && \
+    set -- "$@" --network-config "$MDD_DATA_DIR/update/network.json"
+  if "$@" >/dev/null; then
+    info "imported the media relay image $ref from the Release"
+  else
+    warn "could not import the media relay image from the Release; the control plane will try the registries"
+  fi
+}
+
+media_cli() {
+  if [ "$MODE" = local ]; then
+    ( cd "$REPO_DIR/control" && MDD_DATA="$(data_dir_abs)" MDD_HOST_DATA="$(data_dir_abs)" \
+        MDD_ENGINE_IMAGE="$ENGINE_IMAGE" "$VENV_DIR/bin/python" -m app.media "$@" )
+  else
+    docker exec -w /app/control "$CONTROL_NAME" python -m app.media "$@"
+  fi
+}
+
+cmd_media() {
+  need_root
+  resolve_mode
+  control_running || die "the control plane is not running; start it first ($0 start)"
+  # shellcheck disable=SC2086
+  set -- $ARGS
+  sub="${1:-status}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    status) media_cli status ;;
+    relay)
+      ensure_relay_image
+      media_cli relay "$@" || exit 1
+      info "open UDP and TCP on the relay port in any firewall or router in front of this host" ;;
+    direct) media_cli direct "$@" ;;
+    *) die "usage: $0 media [status | relay [--port N] [--bind ADDR] [--public-host HOST] [--public-port N] | direct]" ;;
+  esac
 }
 
 cmd_start() {
@@ -1398,6 +1553,7 @@ cmd_uninstall() {
   info "removing native control plane (if any)…"
   remove_control_local
   remove_orchestrator
+  remove_mms_at_port_rule
   if [ -f /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf ]; then
     rm -f /etc/systemd/system/ModemManager.service.d/90-mdd-command-interface.conf
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1406,6 +1562,8 @@ cmd_uninstall() {
   info "removing MDD containers…"
   if managed_control_exists; then docker rm -f "$CONTROL_NAME" >/dev/null; fi
   for n in $(engine_names); do docker rm -f "$n" >/dev/null 2>&1 || true; done
+  if docker_container_owned "$RELAY_NAME"; then docker rm -f "$RELAY_NAME" >/dev/null 2>&1 || true; fi
+  docker network rm "$MEDIA_NETWORK" >/dev/null 2>&1 || true
   if [ "$PURGE" = 1 ]; then
     # Full teardown: also drop images (incl. the slow, patched engine image) and data+venv.
     info "removing MDD images…"
@@ -1590,6 +1748,10 @@ cmd_reset_admin() {
   mkdir -p "$(dirname -- "$backup")"
   mv "$auth_file" "$backup"
   chmod 600 "$backup" 2>/dev/null || true
+  # Client app tokens were issued by the old administrator; a reset is usually because a phone
+  # or the password was lost, so none of them may outlive it (the control plane also refuses
+  # them while no administrator is configured, and revokes them when a new one is set up).
+  [ -f "$MDD_DATA_DIR/clients.json" ] && rm -f "$MDD_DATA_DIR/clients.json"
   info "administrator account reset; previous credential file preserved at $backup"
   info "open the WebUI to create a new administrator account"
 }
@@ -1879,6 +2041,9 @@ ${B}MDD Sim Gateway installer${N}
   $0 disable-autostart    do not start on boot
   $0 uninstall [--purge]  remove MDD containers/images/service (--purge also deletes data+venv)
   $0 status               show mode + component status
+  $0 media [relay [--port N] [--public-host HOST] | direct]
+                          show or switch how call media travels: direct (default, each line
+                          publishes its RTP ports) or relay (one TURN port, default 8478)
   $0 diagnose             print a masked card-path report (readers, bridges, lpac, logs)
   $0 reset-admin          reset the local administrator (old credential file is backed up)
   $0 logs                 follow control-plane logs
@@ -1936,6 +2101,7 @@ case "$CMD" in
   disable-autostart)  cmd_disable_autostart ;;
   uninstall)          cmd_uninstall ;;
   status)             cmd_status ;;
+  media)              cmd_media ;;
   diagnose)           cmd_diagnose ;;
   reset-admin)        cmd_reset_admin ;;
   logs)               cmd_logs ;;

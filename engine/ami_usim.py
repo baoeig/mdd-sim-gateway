@@ -157,18 +157,73 @@ def write_status(**kw):
     os.replace(tmp, os.path.join(RUNDIR, "usim_status.json"))
 
 
+ICCID_BYTES = 10
+ICCID_MIN_DIGITS = 15
+
+
 def swap_nibbles(s):
     return "".join([x + y for x, y in zip(s[1::2], s[0::2])])
 
 
 def dec_imsi(ef):
+    """Decode EF_IMSI; None for anything that is not a plausible IMSI, so a garbled
+    read surfaces as a failure instead of a bogus identity."""
     if len(ef) < 4:
         return None
-    l = int(ef[0:2], 16) * 2 - 1
-    swapped = swap_nibbles(ef[2:]).rstrip("f")
-    if len(swapped) < 1:
+    try:
+        length = int(ef[0:2], 16)
+    except ValueError:
         return None
-    return swapped[1:]
+    if not (1 <= length <= 8):
+        return None
+    swapped = swap_nibbles(ef[2:]).rstrip("f")
+    imsi = swapped[1:length * 2] if swapped else ""
+    if not (5 <= len(imsi) <= 15) or not imsi.isdigit():
+        return None
+    return imsi
+
+
+def _apdu_with_le(apdu, le):
+    """Rebuild an APDU carrying the Le the card asked for in a 6Cxx status. Case 2 replaces
+    the trailing Le byte; case 3/4 keeps Lc and the command data and re-stamps only Le.
+    Truncating to CLA/INS/P1/P2 (what the first version did) turned a case-4 SELECT into a
+    malformed command, so the retry failed and a healthy file read as unselectable."""
+    head = list(apdu[:4])
+    if len(apdu) <= 5:
+        return head + [le]
+    lc = apdu[4]
+    return head + [lc] + list(apdu[5:5 + lc]) + [le]
+
+
+def _xfr(connection, apdu):
+    """Transmit one APDU, normalizing reader/protocol variance (issue #51). TPDU-level
+    T=0 readers answer case-4 commands with 61xx and expect an explicit GET RESPONSE;
+    APDU-level readers and T=1 hand back the data with 9000 directly. 6Cxx means
+    "wrong Le, retry with mine". Callers see one shape: (data, 0x90, 0x00) on success.
+
+    61xx already means the card ACCEPTED the command -- the GET RESPONSE that follows only
+    fetches the body. Reporting that fetch's status as the command's status made a good
+    SELECT ADF.USIM read as a card fault on cards whose GET RESPONSE answers anything but
+    9000, which is issue #60: read_card bailed out with no PIN state at all and the start
+    preflight then asked for a PIN the card never wanted. Callers that need the body check
+    the body they got, so answering "accepted, here is what we could fetch" is safe."""
+    data, sw1, sw2 = connection.transmit(apdu)
+    data = list(data)
+    accepted = False
+    for _ in range(8):      # bound: a card that keeps re-asking cannot spin us forever
+        if sw1 == 0x61:
+            accepted = True
+            more, sw1, sw2 = connection.transmit([0x00, 0xC0, 0x00, 0x00, sw2])
+            data += list(more)
+            continue
+        if sw1 == 0x6C and sw2 and not accepted:
+            data, sw1, sw2 = connection.transmit(_apdu_with_le(apdu, sw2))
+            data = list(data)
+            continue
+        break
+    if accepted and sw1 != 0x90:
+        return data, 0x90, 0x00
+    return data, sw1, sw2
 
 
 # 3GPP USIM AID prefix. EF_DIR record 1 is NOT always the USIM (China Telecom cards
@@ -179,16 +234,13 @@ USIM_AID_PREFIX = "A0000000871002"
 def _usim_aid_from_dir(connection):
     """Scan EF_DIR records for the USIM AID; prefer 3GPP USIM, fall back to the first
     application. EF.DIR must be selectable from the current DF. Returns (len, hex) or None."""
-    data, sw1, sw2 = connection.transmit(toBytes("00a40004022f0000"))  # SELECT EF.DIR
-    if sw1 != 0x61:
-        return None
-    fcp, sw1, sw2 = connection.transmit(toBytes("00C00000") + [sw2])
+    fcp, sw1, sw2 = _xfr(connection, toBytes("00a40004022f0000"))  # SELECT EF.DIR
     if sw1 != 0x90 or len(fcp) < 8:
         return None
     record_length = fcp[7]
     first = None
     for rec in range(1, 11):
-        data, sw1, sw2 = connection.transmit(toBytes("00b2") + [rec, 0x04, record_length])
+        data, sw1, sw2 = _xfr(connection, toBytes("00b2") + [rec, 0x04, record_length])
         if sw1 != 0x90 or len(data) < 5 or data[0] != 0x61 or data[2] != 0x4F:
             break
         aid_length = data[3]
@@ -215,8 +267,9 @@ def make_connection_index(reader_index):
         return None
     aid_length, aid = got
     print(f"Using aid={aid}")
-    data, sw1, sw2 = connection.transmit(toBytes("00a40404") + [aid_length] + toBytes(aid))
-    if sw1 != 0x61:
+    data, sw1, sw2 = _xfr(
+        connection, toBytes("00a40404%02X%s" % (aid_length, aid)))
+    if sw1 != 0x90:
         print("Failed to select AID")
         return None
     return connection
@@ -271,13 +324,21 @@ def _with_deadline(fn, timeout=None):
 
 
 def read_iccid(connection):
-    """Read EF.ICCID (no PIN required). Returns None when the card will not answer."""
+    """Read EF.ICCID (no PIN required). None when the card will not answer readably.
+
+    EF.ICCID is exactly 10 BCD bytes (TS 31.102). A short read, or a value that is not
+    all digits, is a card or reader fault rather than an identity -- and every caller
+    convicts a reader on ANY non-empty ICCID that differs from the line's, so handing one
+    a truncated value would strand a line whose binding is perfectly correct. Returning
+    None keeps the documented fail-open direction: we simply cannot convict.
+    """
     connection.transmit(toBytes("00a40004023f0000"))
     connection.transmit(toBytes("00a40004022fe200"))
     data, sw1, sw2 = connection.transmit(toBytes("00b000000a"))
-    if sw1 != 0x90:
+    if sw1 != 0x90 or len(data) != ICCID_BYTES:
         return None
-    return swap_nibbles(bytes(data).hex()).rstrip("f")
+    iccid = swap_nibbles(bytes(data).hex()).rstrip("f")
+    return iccid if iccid.isdigit() and len(iccid) >= ICCID_MIN_DIGITS else None
 
 
 def foreign_iccid(connection):
@@ -339,10 +400,10 @@ def make_connection_name(reader_name):
             connection = make_connection_index(idx)
             if connection is None:
                 continue
-            data, sw1, sw2 = connection.transmit(toBytes("00a40004026f0700"))
-            if sw1 != 0x61:
+            data, sw1, sw2 = _xfr(connection, toBytes("00a40004026f0700"))
+            if sw1 != 0x90:
                 continue
-            data, sw1, sw2 = connection.transmit(toBytes("00b0000009"))
+            data, sw1, sw2 = _xfr(connection, toBytes("00b0000009"))
             if (sw1, sw2) != (0x90, 0x00):
                 continue
             imsi = dec_imsi(bytes(data).hex())
@@ -373,7 +434,7 @@ def make_reselect_adf(connection):
     if got is None:
         return
     aid_length, aid = got
-    connection.transmit(toBytes("00a40404") + [aid_length] + toBytes(aid))
+    _xfr(connection, toBytes("00a40404%02X%s" % (aid_length, aid)))
 
 
 def select_adf_usim(connection):
@@ -383,8 +444,9 @@ def select_adf_usim(connection):
     if got is None:
         return False
     aid_length, aid = got
-    data, sw1, sw2 = connection.transmit(toBytes("00a40404") + [aid_length] + toBytes(aid))
-    return sw1 == 0x61
+    data, sw1, sw2 = _xfr(
+        connection, toBytes("00a40404%02X%s" % (aid_length, aid)))
+    return sw1 == 0x90
 
 
 def open_usim(reader_spec):
@@ -436,8 +498,8 @@ def open_usim(reader_spec):
                 continue
             with _Tx(conn):
                 if select_adf_usim(conn) and verify_pin(conn):
-                    conn.transmit(toBytes("00a40004026f0700"))
-                    d, s1, s2 = conn.transmit(toBytes("00b0000009"))
+                    _xfr(conn, toBytes("00a40004026f0700"))
+                    d, s1, s2 = _xfr(conn, toBytes("00b0000009"))
                     if s1 == 0x90 and dec_imsi(bytes(d).hex()) == target:
                         return conn
             try:
@@ -472,6 +534,9 @@ def verify_pin(connection):
         return True  # already verified in this card session
     if s1 == 0x63 and (s2 & 0x0F) < 2:
         print(f"Refusing PIN verify: only {s2 & 0x0F} tries left", flush=True)
+        return False
+    if not (4 <= len(USIM_PIN) <= 8) or not USIM_PIN.isdigit():
+        print("Refusing PIN verify: malformed USIM_PIN (want 4-8 digits)", flush=True)
         return False
     body = [ord(c) for c in USIM_PIN] + [0xFF] * (8 - len(USIM_PIN))
     d, s1, s2 = connection.transmit(toBytes("00200001") + [0x08] + body)
@@ -510,10 +575,9 @@ def read_res_ck_ik(reader_spec, rand, autn):
             if not verify_pin(conn):
                 write_status(state="PIN_FAIL")
                 return res, ck, ik, auts
-            data, sw1, sw2 = conn.transmit(
-                toBytes("008800812210" + rand.upper() + "10" + autn.upper()))
-            if sw1 == 0x61:
-                data, sw1, sw2 = conn.transmit(toBytes("00C00000") + [sw2])
+            data, sw1, sw2 = _xfr(conn, toBytes(
+                "008800812210" + rand.upper() + "10" + autn.upper()))
+            if (sw1, sw2) == (0x90, 0x00) and data:
                 result = toHexString(data).replace(" ", "")
                 rc = result[0:2]
                 if rc == "DB":  # success

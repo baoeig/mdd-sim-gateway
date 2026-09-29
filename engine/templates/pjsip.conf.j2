@@ -109,17 +109,19 @@ transport=volte_ims
    (domain wins if set, else the manager-supplied advertise_addr = host LAN IP). #}
 {% set local_ext = domain or advertise_addr %}
 {% if webrtc_enable %}
-; WebRTC (wss) rides on the built-in HTTP/TLS server configured in http.conf.
-; bind is still REQUIRED (transport_apply rejects the object without it) even though
-; the actual listener is http.conf's tlsbindaddr; without it the transport object is
-; never created and any INVITE on the webrtc endpoint dies with 500
-; ("Unable to retrieve PJSIP transport 'transport-wss'").
-[transport-wss]
+; WebRTC (ws) rides on the built-in HTTP server configured in http.conf, reached only through
+; the control surface relay. bind is still REQUIRED (transport_apply rejects the object without
+; it) even though the actual listener is http.conf's bindaddr; without it the transport object
+; is never created and any INVITE on the webrtc endpoint dies with 500
+; ("Unable to retrieve PJSIP transport 'transport-ws'").
+[transport-ws]
 type=transport
-protocol=wss
+protocol=ws
 bind=0.0.0.0
 {% if local_ext %}
+{% if not media_relay %}
 external_media_address={{ local_ext }}
+{% endif %}
 external_signaling_address={{ local_ext }}
 {% endif %}
 {% endif %}
@@ -136,14 +138,21 @@ message_context=msg-from-local
 from_domain={{ realm }}
 disallow=all
 allow=amr
+; No opus here on purpose. codec_opus is not an Asterisk source module — codecs/codecs.xml
+; declares it support_level=external, i.e. a prebuilt binary downloaded from Digium, and
+; build_tools/download_externals hard-refuses any non-x86 HOST_CPU. On the aarch64 image there
+; is therefore no codec_opus.so and no opus entry in `core show translation`. Offering opus
+; here was a trap: a browser that only offers opus, or a negotiation that happens to pick it,
+; produces a call with no transcoding path to the AMR-only IMS leg — i.e. silent audio.
+; ulaw/alaw are what actually carries every WebRTC call today. (res_format_attr_opus.so is
+; still loaded so an opus-bearing re-INVITE from the far end parses cleanly instead of erroring.)
 allow=ulaw
 allow=alaw
-allow=opus
 rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
 ; Never let the WebRTC softphone direct-media with the IMS side:
-; the two legs are incompatible (DTLS-SRTP + opus/ulaw on the client vs plain RTP + AMR on
+; the two legs are incompatible (DTLS-SRTP + ulaw/alaw on the client vs plain RTP + AMR on
 ; the carrier), so Asterisk MUST stay in the media path to bridge/transcode. With direct_media
 ; left on (the default) Asterisk would try to re-INVITE the two ends to talk directly, which
 ; can't work → no audio. (volte_ims already has direct_media=no.)
@@ -165,8 +174,15 @@ remove_existing=yes
 [{{ webrtc_user }}](endpoint-local)
 auth=auth-{{ webrtc_user }}
 aors={{ webrtc_user }}
-transport=transport-wss
+transport=transport-ws
 webrtc=yes
+{% if media_relay and media_addr %}
+; Relay media mode: RTP binds to the media network address, which only the relay reaches and
+; where the engine admits nothing but this RTP range. The IMS leg is not affected: it keeps
+; its own transport inside the tunnel.
+media_address={{ media_addr }}
+bind_rtp_to_media_address=yes
+{% endif %}
 dtls_auto_generate_cert=yes
 [auth-{{ webrtc_user }}](auth-local)
 username={{ webrtc_user }}

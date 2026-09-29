@@ -91,14 +91,73 @@ def write_status(state, tries_left=None, reader=None, detail=None, iccid=None):
     log(f"status={state} tries_left={tries_left} detail={detail}")
 
 
+ICCID_BYTES = 10
+ICCID_MIN_DIGITS = 15
+
+
 def swap_nibbles(s):
     return "".join([x + y for x, y in zip(s[1::2], s[0::2])])
 
 
+def _apdu_with_le(apdu, le):
+    """Rebuild an APDU carrying the Le the card asked for in a 6Cxx status. Case 2 replaces
+    the trailing Le byte; case 3/4 keeps Lc and the command data and re-stamps only Le.
+    Truncating to CLA/INS/P1/P2 (what the first version did) turned a case-4 SELECT into a
+    malformed command, so the retry failed and a healthy file read as unselectable."""
+    head = list(apdu[:4])
+    if len(apdu) <= 5:
+        return head + [le]
+    lc = apdu[4]
+    return head + [lc] + list(apdu[5:5 + lc]) + [le]
+
+
+def _xfr(conn, apdu):
+    """Transmit one APDU, normalizing reader/protocol variance (issue #51). TPDU-level
+    T=0 readers answer case-4 commands with 61xx and expect an explicit GET RESPONSE;
+    APDU-level readers and T=1 hand back the data with 9000 directly. 6Cxx means
+    "wrong Le, retry with mine". Callers see one shape: (data, 0x90, 0x00) on success.
+
+    61xx already means the card ACCEPTED the command -- the GET RESPONSE that follows only
+    fetches the body. Reporting that fetch's status as the command's status made a good
+    SELECT ADF.USIM read as a card fault on cards whose GET RESPONSE answers anything but
+    9000, which is issue #60: read_card bailed out with no PIN state at all and the start
+    preflight then asked for a PIN the card never wanted. Callers that need the body check
+    the body they got, so answering "accepted, here is what we could fetch" is safe."""
+    data, s1, s2 = conn.transmit(apdu)
+    data = list(data)
+    accepted = False
+    for _ in range(8):      # bound: a card that keeps re-asking cannot spin us forever
+        if s1 == 0x61:
+            accepted = True
+            more, s1, s2 = conn.transmit([0x00, 0xC0, 0x00, 0x00, s2])
+            data += list(more)
+            continue
+        if s1 == 0x6C and s2 and not accepted:
+            data, s1, s2 = conn.transmit(_apdu_with_le(apdu, s2))
+            data = list(data)
+            continue
+        break
+    if accepted and s1 != 0x90:
+        return data, 0x90, 0x00
+    return data, s1, s2
+
+
 def dec_imsi(ef_hex):
-    l = int(ef_hex[0:2], 16) * 2 - 1
+    """Decode EF_IMSI; None for anything that is not a plausible IMSI, so a garbled
+    read surfaces as a failure instead of a bogus identity."""
+    if len(ef_hex) < 4:
+        return None
+    try:
+        length = int(ef_hex[0:2], 16)
+    except ValueError:
+        return None
+    if not (1 <= length <= 8):
+        return None
     swapped = swap_nibbles(ef_hex[2:]).rstrip("f")
-    return swapped[1:]
+    imsi = swapped[1:length * 2] if swapped else ""
+    if not (5 <= len(imsi) <= 15) or not imsi.isdigit():
+        return None
+    return imsi
 
 
 # 3GPP USIM AID prefix. EF_DIR record 1 is NOT always the USIM (China Telecom cards
@@ -109,16 +168,13 @@ USIM_AID_PREFIX = "A0000000871002"
 def _usim_aid_from_dir(conn):
     """Scan EF_DIR records for the USIM AID; prefer 3GPP USIM, fall back to the first
     application. Returns (aid_len, aid_hex) or None."""
-    d, s1, s2 = conn.transmit(toBytes("00a40004022f0000"))  # SELECT EF.DIR
-    if s1 != 0x61:
-        return None
-    fcp, s1, s2 = conn.transmit(toBytes("00C00000") + [s2])
+    fcp, s1, s2 = _xfr(conn, toBytes("00a40004022f0000"))  # SELECT EF.DIR
     if s1 != 0x90 or len(fcp) < 8:
         return None
     rec_len = fcp[7]
     first = None
     for rec in range(1, 11):
-        d, s1, s2 = conn.transmit(toBytes("00b2") + [rec, 0x04, rec_len])
+        d, s1, s2 = _xfr(conn, toBytes("00b2") + [rec, 0x04, rec_len])
         # record template: 61 <len> 4F <aidlen> <AID...> [50 <len> label]
         if s1 != 0x90 or len(d) < 5 or d[0] != 0x61 or d[2] != 0x4F:
             break
@@ -140,13 +196,13 @@ def select_adf_usim(conn):
     if not got:
         return False
     aid_len, aid = got
-    d, s1, s2 = conn.transmit(toBytes("00a40404") + [aid_len] + toBytes(aid))
-    return s1 == 0x61
+    d, s1, s2 = _xfr(conn, toBytes("00a40404%02X%s" % (aid_len, aid)))
+    return s1 == 0x90
 
 
 def read_imsi(conn):
-    conn.transmit(toBytes("00a40004026f0700"))
-    d, s1, s2 = conn.transmit(toBytes("00b0000009"))
+    _xfr(conn, toBytes("00a40004026f0700"))
+    d, s1, s2 = _xfr(conn, toBytes("00b0000009"))
     if s1 != 0x90:
         return None
     return dec_imsi(bytes(d).hex())
@@ -165,6 +221,8 @@ def pin_tries_left(conn):
 
 
 def verify_pin(conn, pin):
+    if not (4 <= len(pin) <= 8) or not pin.isdigit():
+        return 0x67, 0x00  # refuse to send a malformed VERIFY body (would spend a try)
     body = [ord(c) for c in pin] + [0xFF] * (8 - len(pin))
     d, s1, s2 = conn.transmit(toBytes("00200001") + [0x08] + body)
     return s1, s2
@@ -218,13 +276,21 @@ def _with_deadline(fn, timeout=None):
 
 
 def read_iccid(conn):
+    """Read EF.ICCID (no PIN required). None when the card will not answer readably.
+
+    EF.ICCID is exactly 10 BCD bytes (TS 31.102). A short read, or a value that is not
+    all digits, is a card or reader fault rather than an identity -- and every caller
+    convicts a reader on ANY non-empty ICCID that differs from the line's, so handing one
+    a truncated value would strand a line whose binding is perfectly correct. Returning
+    None keeps the documented fail-open direction: we simply cannot convict.
+    """
     conn.transmit(toBytes("00a40004023f0000"))
-    conn.transmit(toBytes("00a40004022fe200"))
-    d, s1, s2 = conn.transmit(toBytes("00b000000a"))
-    if s1 != 0x90:
+    _xfr(conn, toBytes("00a40004022fe200"))
+    d, s1, s2 = _xfr(conn, toBytes("00b000000a"))
+    if s1 != 0x90 or len(d) != ICCID_BYTES:
         return None
-    hx = bytes(d).hex()
-    return swap_nibbles(hx).rstrip("f")
+    iccid = swap_nibbles(bytes(d).hex()).rstrip("f")
+    return iccid if iccid.isdigit() and len(iccid) >= ICCID_MIN_DIGITS else None
 
 
 class WrongCard(Exception):

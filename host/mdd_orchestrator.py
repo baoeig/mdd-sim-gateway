@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+from copy import deepcopy
 import hashlib
 import ipaddress
 import json
@@ -26,6 +27,11 @@ import urllib.request
 from pathlib import Path
 
 try:
+    from host import modem_probe
+except ImportError:  # run as host/mdd_orchestrator.py, with host/ itself on the path
+    import modem_probe
+
+try:
     import serial
 except ImportError:  # pragma: no cover - host installer provides pyserial
     serial = None
@@ -34,6 +40,13 @@ try:
     import yaml
 except ImportError:  # pragma: no cover - installer provides PyYAML
     yaml = None
+
+
+def load_yaml_text(text: str) -> dict:
+    """Parse with libyaml when PyYAML has it: the same safe schema, far less CPU. The country
+    egress re-reads a subscription of hundreds of nodes every few seconds."""
+    loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
+    return yaml.load(text, Loader=loader) or {}
 
 # 0x8C7B (35963) is vpcd's own default port, which the distribution package hands to its
 # "Virtual PCD" reader. Two pcscd readers cannot listen on one port, so sharing that base
@@ -135,6 +148,12 @@ def b64_padded(value: str) -> str:
     return base64.b64decode(text + "=" * (-len(text) % 4)).decode("utf-8", errors="replace")
 
 
+# Transports this converter can actually render into a working outbound. A link naming
+# anything else (grpc, h2, httpupgrade, quic, splithttp) must be refused rather than
+# silently downgraded to plain TCP.
+SUPPORTED_LINK_TRANSPORTS = {"", "tcp", "ws", "xhttp"}
+
+
 def parse_share_link(url: str) -> dict:
     """Convert one protocol share link into the Clash-style node dict clash_outbound() takes.
 
@@ -178,7 +197,12 @@ def parse_share_link(url: str) -> dict:
     if not parsed.hostname or not parsed.port:
         raise ValueError("node link is missing a host or port")
     query = {key: value[0] for key, value in parse_qs(parsed.query).items()}
+    # Hysteria2 carries its whole auth string in userinfo, and that string is allowed to
+    # contain a colon ("user:pass"). Reading only .username silently truncated it, so the
+    # server rejected an authentication the operator had pasted correctly.
     userinfo = unquote(parsed.username or "")
+    if parsed.password is not None:
+        userinfo = userinfo + ":" + unquote(parsed.password)
     node = {"server": parsed.hostname, "port": parsed.port,
             "network": query.get("type") or query.get("network") or "tcp",
             "servername": query.get("sni") or query.get("peer") or query.get("host") or "",
@@ -186,14 +210,18 @@ def parse_share_link(url: str) -> dict:
                                     or query.get("insecure") or "").lower() in ("1", "true")}
     if scheme == "vless":
         node.update({"type": "vless", "uuid": userinfo, "flow": query.get("flow") or "",
+                     # VLESS Encryption (Xray 26.7+): the server declares a `decryption` and
+                     # the client must echo the matching `encryption`. Dropping it produced a
+                     # client that connected and could not be understood — every request
+                     # timed out with nothing logged.
+                     "encryption": unquote(query.get("encryption") or "") or "none",
                      "tls": str(query.get("security") or "").lower()
                      in ("tls", "reality", "xtls")})
         if str(query.get("security") or "").lower() == "reality":
             node["reality-opts"] = {"public-key": query.get("pbk") or query.get("publicKey") or "",
-                                    "short-id": query.get("sid") or query.get("shortId") or ""}
+                                    "short-id": query.get("sid") or query.get("shortId") or "",
+                                    "spider-x": unquote(query.get("spx") or "")}
             node["client-fingerprint"] = query.get("fp") or "chrome"
-        if query.get("alpn"):
-            node["alpn"] = [x for x in query["alpn"].split(",") if x]
         if node["network"] == "xhttp":
             try:
                 extra = json.loads(unquote(query.get("extra") or "{}"))
@@ -209,12 +237,31 @@ def parse_share_link(url: str) -> dict:
     elif scheme in ("hysteria2", "hy2"):
         # QUIC-based, so it has no stream transport to describe.
         node.update({"type": "hysteria2", "password": userinfo, "network": "tcp"})
+        # A server expecting salamander discards every unobfuscated packet without a word,
+        # so a link whose obfs parameters are dropped here produces an exit that looks
+        # configured and never carries a byte.
+        if query.get("obfs"):
+            node["obfs"] = query["obfs"]
+            node["obfs-password"] = unquote(
+                query.get("obfs-password") or query.get("obfs_password")
+                or query.get("obfsParam") or "")
     else:
         raise ValueError(f"unsupported node link scheme {scheme or text[:12]!r}")
+    # alpn belongs to the TLS layer every one of these protocols shares; it used to be read
+    # for VLESS only, which quietly dropped the h3 an hysteria2 node may require.
+    if query.get("alpn"):
+        node["alpn"] = [x for x in unquote(query["alpn"]).split(",") if x]
     if node["network"] == "ws":
         host = query.get("host")
         node["ws-opts"] = {"path": unquote(query.get("path") or "/"),
                            "headers": {"Host": host} if host else {}}
+    elif node["network"] not in SUPPORTED_LINK_TRANSPORTS:
+        # Anything else was previously dropped on the floor: the outbound came out as a
+        # plain TCP one, passed every check, and then never completed a handshake. Name the
+        # transport instead, so the operator knows the gateway cannot carry this node.
+        raise ValueError(
+            f"node transport {node['network']!r} is not supported for VoWiFi exits "
+            "(supported: tcp, ws, xhttp)")
     return node
 
 
@@ -275,7 +322,15 @@ EXIT_RANK_WARMUP_SECONDS = float(os.environ.get("MDD_EXIT_RANK_WARMUP", "25"))
 # state that had not changed. When a cycle finds nothing to do the loop backs off, while still
 # waking on the base interval to stat the input documents so an operator action is never
 # delayed by more than one base tick.
+# sing-tun makes every tun it creates the host's catch-all resolver whenever resolvectl is
+# present (see release_tun_dns). It does so once, shortly after start; this bounds how long
+# the orchestrator keeps looking for that registration after sing-box (re)starts.
+TUN_DNS_WATCH_SECONDS = float(os.environ.get("MDD_TUN_DNS_WATCH", "60"))
 IDLE_INTERVAL_SECONDS = float(os.environ.get("MDD_IDLE_INTERVAL", "15"))
+# A modem is plugged in so its SIM can be read; cellular data is a per-device capability, not
+# the box's route to the internet. Set this when the modem genuinely IS the only uplink.
+MODEM_MAY_PROVIDE_DEFAULT_ROUTE = os.environ.get(
+    "MDD_MODEM_ALLOW_DEFAULT_ROUTE", "").strip().lower() in {"1", "true", "yes", "on"}
 # How long a tty may stay unclaimed before the bridge stops waiting for ModemManager and talks
 # to the serial port itself. ModemManager needs on the order of ten to thirty seconds to probe
 # an EC25-class module, so this is set far beyond any healthy first pass: reaching it means
@@ -290,6 +345,18 @@ BRIDGE_RETRY_BASE_SECONDS = 15.0
 BRIDGE_RETRY_CEILING_SECONDS = 600.0
 BRIDGE_STABLE_SECONDS = 60.0
 BRIDGE_SETTLE_SECONDS = 5.0
+# ModemManager parks a modem in state "failed" when its initialisation fails, and does not try
+# again on its own. For these reasons the cause is inside the module (seen: QMI clients left
+# behind by a ModemManager restart mid-probe, "unknown-capabilities"), and a module reboot
+# clears it. Other reasons (sim-missing, sim-error, esim-without-profiles) are not fixed by a
+# reboot and are only reported. Each reboot also interrupts that modem's VoWiFi (about a minute
+# and a half on the test gateway until it registered again), so they are spaced out and bounded,
+# and only made while the device is meant to be on the cellular network: in flight mode nothing
+# needs ModemManager, and the reboot would only interrupt the VoWiFi that is working.
+MM_RESETTABLE_FAILURES = {"unknown-capabilities", "unknown"}
+MM_FAILED_GRACE_SECONDS = 60.0
+MM_RESET_BACKOFF_SECONDS = 300.0
+MM_RESET_ATTEMPTS = 3
 # Grace between publishing "launching" and expecting systemd to report the updater unit as
 # active, so a loop pass that races a launch cannot retire the run it just started.
 UPDATE_LAUNCH_GRACE_SECONDS = 90.0
@@ -334,35 +401,78 @@ def clash_node_supports_udp(node: dict) -> bool:
     return network in {"", "tcp", "ws", "xhttp"}
 
 
-def xray_xhttp_outbound(node: dict, tag: str) -> dict:
-    """Convert a VLESS XHTTP node to Xray-core's native outbound form."""
-    if str(node.get("type") or "").lower() != "vless" \
-            or str(node.get("network") or "").lower() != "xhttp":
-        raise ValueError("XHTTP currently requires a VLESS node")
+def node_needs_xray(node: dict) -> bool:
+    """True when this node is better served by Xray-core than by sing-box.
+
+    REALITY is an Xray protocol and its wire details move with Xray. When a server runs a
+    build newer than the one sing-box's implementation targets, sing-box fails the handshake
+    with "reality verification failed" while Xray clients on the same server connect — a
+    difference that reads to an operator as a broken gateway. Handing REALITY to the engine
+    that defines it removes a whole class of version skew; XHTTP already went this way.
+    """
+    if str(node.get("type") or "").lower() != "vless":
+        return False
+    if str(node.get("network") or "").lower() == "xhttp":
+        return True
+    if str(node.get("encryption") or "none").lower() not in ("", "none"):
+        return True
+    return bool((node.get("reality-opts") or {}).get("public-key"))
+
+
+def xray_outbound(node: dict, tag: str) -> dict:
+    """Convert a VLESS node to Xray-core's native outbound form (raw/ws/xhttp)."""
+    if str(node.get("type") or "").lower() != "vless":
+        raise ValueError("the Xray path currently requires a VLESS node")
+    network = str(node.get("network") or "tcp").lower() or "tcp"
     reality = node.get("reality-opts") or {}
-    if not reality.get("public-key"):
+    if network == "xhttp" and not reality.get("public-key"):
         raise ValueError("Reality XHTTP node is missing its public key (pbk)")
-    user = {"id": str(node.get("uuid") or ""), "encryption": "none",
+    user = {"id": str(node.get("uuid") or ""),
+            "encryption": str(node.get("encryption") or "none"),
             "flow": str(node.get("flow") or "")}
-    if node.get("packet-encoding"):
-        user["packetEncoding"] = str(node["packet-encoding"])
-    xhttp = node.get("xhttp-opts") or {}
-    stream = {"network": "xhttp", "security": "reality",
-              "realitySettings": {
-                  "serverName": node.get("servername") or node.get("server"),
-                  "fingerprint": node.get("client-fingerprint") or "chrome",
-                  "publicKey": reality.get("public-key"),
-                  "shortId": reality.get("short-id") or "",
-              },
-              "xhttpSettings": {"host": xhttp.get("host") or "",
-                                "path": xhttp.get("path") or "/",
-                                "mode": xhttp.get("mode") or "auto"}}
-    if isinstance(xhttp.get("extra"), dict) and xhttp["extra"]:
-        stream["xhttpSettings"]["extra"] = xhttp["extra"]
+    # XUDP is how Xray clients carry UDP inside VLESS, and UDP is the whole point of these
+    # exits — IKE cannot run without it. The XHTTP path already defaulted to it while the
+    # raw/ws path sent nothing, so identical nodes were built two different ways.
+    user["packetEncoding"] = str(node.get("packet-encoding") or "xudp")
+    server_name = node.get("servername") or node.get("server")
+    fingerprint = str(node.get("client-fingerprint") or "") or "chrome"
+    # Xray names the plain TCP transport "raw"; "tcp" remains accepted as its alias.
+    stream = {"network": "raw" if network == "tcp" else network}
+    if reality.get("public-key"):
+        stream["security"] = "reality"
+        stream["realitySettings"] = {
+            "serverName": server_name,
+            "fingerprint": fingerprint,
+            "publicKey": reality.get("public-key"),
+            "shortId": reality.get("short-id") or "",
+        }
+        if reality.get("spider-x"):
+            stream["realitySettings"]["spiderX"] = str(reality["spider-x"])
+    elif node.get("tls"):
+        stream["security"] = "tls"
+        stream["tlsSettings"] = {"serverName": server_name,
+                                 "allowInsecure": bool(node.get("skip-cert-verify", False)),
+                                 "fingerprint": fingerprint}
+        if node.get("alpn"):
+            stream["tlsSettings"]["alpn"] = list(node["alpn"])
+    else:
+        stream["security"] = "none"
+    if network == "xhttp":
+        xhttp = node.get("xhttp-opts") or {}
+        stream["xhttpSettings"] = {"host": xhttp.get("host") or "",
+                                   "path": xhttp.get("path") or "/",
+                                   "mode": xhttp.get("mode") or "auto"}
+        if isinstance(xhttp.get("extra"), dict) and xhttp["extra"]:
+            stream["xhttpSettings"]["extra"] = xhttp["extra"]
+    elif network == "ws":
+        ws = node.get("ws-opts") or {}
+        stream["wsSettings"] = {"path": ws.get("path") or "/",
+                                "headers": ws.get("headers") or {}}
     return {"protocol": "vless", "tag": tag,
             "settings": {"vnext": [{"address": node.get("server"),
                                      "port": int(node.get("port") or 0), "users": [user]}]},
             "streamSettings": stream}
+
 
 
 def outbound_supports_udp(outbound: dict) -> bool:
@@ -385,6 +495,10 @@ def clash_outbound(node: dict, tag: str) -> dict:
     if kind == "trojan":
         base["password"] = node.get("password", "")
     elif kind == "vless":
+        if str(node.get("encryption") or "none").lower() not in ("", "none"):
+            raise ValueError(
+                "this node uses VLESS Encryption, which only Xray-core carries — "
+                "install Xray so the gateway can run it")
         base["uuid"] = node.get("uuid", "")
         base["flow"] = node.get("flow", "")
     elif kind == "vmess":
@@ -445,6 +559,9 @@ class Orchestrator:
         self.device_status_path = self.root / "devices-status.json"
         self.bridge_restart_request_dir = self.root / "bridge-restart-requests"
         self.bridge_restart_status_dir = self.root / "bridge-restart-status"
+        # USB devices that look like a modem but match no model, and operator-requested tests.
+        self.usb_candidates = modem_probe.CandidateScanner(self.root / "usb-candidates.json")
+        self.modem_probes = modem_probe.ProbeRequests(self.root)
         self.generated = self.root / "sing-box.json"
         self.xray_generated = self.root / "xray.json"
         self.cache = self.root / "subscription.yaml"
@@ -465,6 +582,8 @@ class Orchestrator:
         # When sing-box last (re)started; measurements before it settles are cold-start
         # numbers, not node quality.
         self.singbox_started_at = 0.0
+        # Country tuns whose systemd-resolved registration has not been undone yet.
+        self.tun_dns_pending: set[str] = set()
         self.exit_node_history = self.root / "exit-node-history.jsonl"
         self.reselect_path = self.root / "exit-reselect.json"
         self.reselect_handled_path = self.root / "exit-reselect-handled.json"
@@ -522,10 +641,17 @@ class Orchestrator:
         self.bridges: dict[str, subprocess.Popen] = {}
         self.bridge_ports: dict[str, int] = {}
         self.last_proxy_fingerprint = ""
+        self.last_proxy_config: dict | None = None
         self.applied_cellular_backend: bool | None = None
         self.radio_states: dict[str, bool] = {}
         self.cellular_states: dict[str, dict] = {}
         self.data_attempt_at: dict[str, float] = {}
+        # Profiles already re-stamped with modem_profile_policy() this process. Correcting a
+        # legacy profile is a one-off; without this the data-off path would shell out to nmcli
+        # on every reconcile to rewrite settings that already say what we want.
+        self.modem_profile_policed: set[str] = set()
+        # Cleared whenever the cellular backend is up, so standing it back down re-sweeps.
+        self.modem_profiles_swept = False
         self.applied_timezone = ""
         self.obsolete_services_retired = False
         self.reader_config_path = Path(os.environ.get(
@@ -555,6 +681,9 @@ class Orchestrator:
         # status document reported every freshly respawned process as a running bridge.
         self._bridge_started: dict[str, float] = {}
         self._bridge_failures: dict[str, dict] = {}
+        # device id -> ModemManager's "failed" verdict on it: reason, since when, and the
+        # module reboots tried. Cleared once ModemManager reports any other state.
+        self._modem_failed: dict[str, dict] = {}
         # Whether this gateway is configured VoWiFi-only (hardware.modem_backend = serial).
         self._serial_mode = False
         # device id -> the exact command its bridge runs, for the support bundle.
@@ -724,6 +853,21 @@ class Orchestrator:
             mode = str(selection.get("proxy_mode") or "direct").lower()
             if mode == "direct":
                 return {"proxy_url": "", "route": "direct", "route_name": ""}
+            if mode == "country":
+                country = str(selection.get("proxy_country") or "").strip().lower()
+                exit_cfg = (proxy.get("exits") or {}).get(country) or {}
+                state = live.get(country) or {}
+                try:
+                    proxy_port = int(state.get("proxy_port") or 0)
+                except (TypeError, ValueError):
+                    proxy_port = 0
+                proxy_host = str(state.get("proxy_host") or "").strip()
+                if (not re.fullmatch(r"[a-z]{2}", country) or not exit_cfg.get("enabled")
+                        or not state.get("ready") or proxy_host != COUNTRY_PROXY_LISTEN
+                        or not 1 <= proxy_port <= 65535):
+                    raise ValueError("selected update country exit is not ready")
+                return {"proxy_url": f"socks5h://{proxy_host}:{proxy_port}",
+                        "route": "country", "route_name": country.upper()}
             if mode != "library":
                 raise ValueError("invalid update proxy mode")
             profile_id = str(selection.get("proxy_profile_id") or "").strip()
@@ -944,7 +1088,10 @@ class Orchestrator:
             # refused read as an indefinite spinner with no explanation; the reason belongs
             # in the error field instead.
             degraded = self._degraded.get(device_id, "")
-            device_transitioning = bool(transitioning or (not degraded and
+            # A modem ModemManager has failed is a settled outcome as well: its reason is in
+            # the cellular state, and VoWiFi carries on through the bridge.
+            modem_failed = device_id in self._modem_failed
+            device_transitioning = bool(transitioning or (not degraded and not modem_failed and
                 present and (target_data_active != observed_data_active or
                              (backend_active and radio_enabled is not None and
                               bool(wanted.get("flight_mode")) == radio_enabled) or
@@ -1032,15 +1179,7 @@ class Orchestrator:
             if not Path(port).exists():
                 continue
             try:
-                modem = serial.Serial(port, 115200, timeout=.5, write_timeout=2,
-                                      exclusive=True)
-                try:
-                    modem.reset_input_buffer()
-                    modem.write(b"AT+CFUN=1,1\r")
-                    modem.flush()
-                    time.sleep(1)
-                finally:
-                    modem.close()
+                self.reboot_modem(port)
                 reset += 1
             except Exception as exc:
                 errors.append(f"{port}: {exc}")
@@ -1049,6 +1188,73 @@ class Orchestrator:
         if reset:
             # USB serial ports disappear and return after the module reboot.
             time.sleep(12)
+
+    @staticmethod
+    def reboot_modem(port: str) -> None:
+        """Reboot the module behind an AT port (AT+CFUN=1,1). Its USB ports disappear and
+        come back; the caller waits for them."""
+        modem = serial.Serial(port, 115200, timeout=.5, write_timeout=2, exclusive=True)
+        try:
+            modem.reset_input_buffer()
+            modem.write(b"AT+CFUN=1,1\r")
+            modem.flush()
+            time.sleep(1)
+        finally:
+            modem.close()
+
+    def recover_failed_modem(self, modem: dict, reason: str, wanted: bool = True) -> None:
+        """ModemManager gave up on this modem. Reboot the module when that can help, spaced
+        out and at most MM_RESET_ATTEMPTS times; ModemManager probes it afresh when its ports
+        return. Retrying --enable, as before, only repeated "Wrong state" every cycle.
+
+        ``wanted`` is False in flight mode: the failure is recorded but nothing is rebooted.
+        Times are monotonic, so the clock being set at boot neither skips the grace period
+        nor stretches the backoff."""
+        device_id = modem["id"]
+        now = time.monotonic()
+        record = self._modem_failed.setdefault(
+            device_id, {"reason": reason, "since": now, "resets": 0, "rebooted": 0,
+                        "last_reset": None})
+        record["reason"] = reason
+        if not wanted or reason not in MM_RESETTABLE_FAILURES or \
+                record["resets"] >= MM_RESET_ATTEMPTS:
+            return
+        if now - record["since"] < MM_FAILED_GRACE_SECONDS:
+            return
+        if record["last_reset"] is not None and \
+                now - record["last_reset"] < MM_RESET_BACKOFF_SECONDS * (2 ** (record["resets"] - 1)):
+            return
+        if serial is None or self.dry_run:
+            return
+        record["resets"] += 1
+        record["last_reset"] = now
+        self.log(f"ModemManager failed {device_id} ({reason}); rebooting the module "
+                 f"(attempt {record['resets']} of {MM_RESET_ATTEMPTS})")
+        try:
+            self.reboot_modem(modem["tty"])
+            record["rebooted"] += 1
+        except Exception as exc:
+            self.log(f"could not reboot {device_id}: {exc}")
+
+    def forget_absent_modem_failures(self, live_ids: set) -> None:
+        """A module this loop just rebooted is briefly absent; keeping its record is what
+        bounds the reboots. Anything else absent was unplugged, which starts afresh."""
+        now = time.monotonic()
+        self._modem_failed = {device_id: value for device_id, value
+                              in self._modem_failed.items()
+                              if device_id in live_ids or
+                              (value["last_reset"] is not None and
+                               now - value["last_reset"] < MM_RESET_BACKOFF_SECONDS)}
+
+    def modem_failure(self, device_id: str) -> dict:
+        """What the control plane shows for a failed modem; {} when it is not failed."""
+        record = self._modem_failed.get(device_id)
+        if not record:
+            return {}
+        resettable = record["reason"] in MM_RESETTABLE_FAILURES
+        return {"reason": record["reason"], "resettable": resettable,
+                "resets": record["resets"], "rebooted": record["rebooted"],
+                "exhausted": resettable and record["resets"] >= MM_RESET_ATTEMPTS}
 
     def _bridge_stderr_path(self, hwid: str):
         # Since 1.3.10 this carries the bridge's stdout too: its activity lines used to go
@@ -1261,9 +1467,34 @@ class Orchestrator:
         run commands. Fields are drawn from state this cycle already computed; nothing is
         collected merely to fill the file.
         """
+        now = int(time.time())
+
+        def bridge_identity_health(hwid: str) -> dict:
+            metadata = read_json(self.data / "modems" / f"{hwid}.json")
+            imei = re.sub(r"\D", "", str(metadata.get("imei") or ""))
+            iccid = re.sub(r"\D", "", str(metadata.get("iccid") or ""))
+            def nonnegative_int(value) -> int:
+                try:
+                    return max(0, int(value or 0))
+                except (TypeError, ValueError, OverflowError):
+                    return 0
+
+            updated_at = nonnegative_int(metadata.get("updated_at"))
+            requested = nonnegative_int(metadata.get("channel_requested"))
+            allocated = nonnegative_int(metadata.get("channel_allocated"))
+            return {
+                "metadata_age_seconds": max(0, now - updated_at) if updated_at else None,
+                "imei_valid": len(imei) == 15,
+                "iccid_valid": iccid.startswith("89") and 19 <= len(iccid) <= 22,
+                # Every requested slot is served, on its own channel or a shared one.
+                "channels_ready": (metadata.get("channel_status") == "ready" and requested > 0
+                                   and allocated > 0 and nonnegative_int(
+                                       metadata.get("slots_served", allocated)) == requested),
+            }
+
         atomic_json(self.host_diagnostics_path, {
             "version": 1,
-            "updated_at": int(time.time()),
+            "updated_at": now,
             "virtualization": self.virtualization(),
             "modem_backend": "serial" if self._serial_mode else "auto",
             "modemmanager": {
@@ -1282,7 +1513,8 @@ class Orchestrator:
             "assignments": assignments,
             "bridges": {hwid: {"pid": proc.pid, "running": proc.poll() is None,
                                "command": self._bridge_commands.get(hwid) or [],
-                               "log_tail": self._bridge_log_tail(hwid)}
+                               "log_tail": self._bridge_log_tail(hwid),
+                               **bridge_identity_health(hwid)}
                         for hwid, proc in self.bridges.items()},
             # Which of the assigned VPCD ports pcscd is actually listening on, read from
             # /proc/net/tcp — a probe connection could hijack a reader slot, a file cannot.
@@ -1313,6 +1545,22 @@ class Orchestrator:
     def _kv(text: str, key: str) -> str:
         match = re.search(rf"^{re.escape(key)}\s*:\s*(.*?)\s*$", text or "", re.MULTILINE)
         return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def normalize_iccid(value: str) -> str:
+        """Return a usable SIM ICCID from a ModemManager property, or "".
+
+        mmcli renders a property it could not read as the literal placeholder "--"
+        (observed when a module rejects the EF_ICCID read). That is "unknown", not an
+        identity: passed through, it reaches the control plane as a truthy ICCID that
+        matches no line, so the SIM never falls through to the PC/SC bridge that can
+        still read it. Validated like the bridge's own decoder: 18-20 digits from 89.
+        """
+        text = str(value or "").strip()
+        if not text or text.casefold() in {"--", "unknown", "none", "n/a"}:
+            return ""
+        digits = re.sub(r"\D", "", text)
+        return digits if digits.startswith("89") and 18 <= len(digits) <= 20 else ""
 
     @staticmethod
     def normalize_msisdn(value: str) -> str:
@@ -1346,6 +1594,10 @@ class Orchestrator:
         text = detail.stdout or ""
         power = self._kv(text, "modem.generic.power-state").lower()
         state = self._kv(text, "modem.generic.state").lower()
+        failed_reason = (self._kv(text, "modem.generic.state-failed-reason").lower()
+                         if state == "failed" else "")
+        if failed_reason in {"--", "none"}:
+            failed_reason = "unknown"
         primary = self._kv(text, "modem.generic.primary-port")
         ports = re.findall(r"modem\.generic\.ports\.value\[\d+\]\s*:\s*([^ ]+) \(([^)]+)\)", text)
         network_port = next((name for name, kind in ports if kind == "net"), "")
@@ -1363,7 +1615,8 @@ class Orchestrator:
         if sim_object and sim_object not in {"--", "/"}:
             sim_detail = run(["mmcli", "-i", sim_object, "--output-keyvalue"])
             if sim_detail.returncode == 0:
-                sim_iccid = self._kv(sim_detail.stdout or "", "sim.properties.iccid")
+                sim_iccid = self.normalize_iccid(
+                    self._kv(sim_detail.stdout or "", "sim.properties.iccid"))
         # Many USB modems keep their hardware power-state at "on" after
         # ModemManager --disable.  The generic state is the authoritative RF state.
         radio_enabled = power == "on" and state not in {
@@ -1374,7 +1627,7 @@ class Orchestrator:
         snapshot = {
             "available": True, "mm_object": obj, "powered": power == "on",
             "radio_enabled": radio_enabled,
-            "state": state, "registration": registration,
+            "state": state, "failed_reason": failed_reason, "registration": registration,
             "operator": operator,
             "signal": int(signal) if signal.isdigit() else None,
             "primary_port": primary, "network_interface": network_port,
@@ -1421,6 +1674,30 @@ class Orchestrator:
                     profiles.append((parts[0].replace(r"\:", ":"), parts[2]))
         return profiles
 
+    @staticmethod
+    def modem_profile_policy() -> list[str]:
+        """nmcli properties that keep a modem's data profile from becoming the host uplink.
+
+        Two separate things went wrong without them. The profile was created with autoconnect
+        on, so NetworkManager dialled it after a reboot however the operator had set this
+        modem's cellular-data switch -- the switch was silently not durable. And nothing
+        stopped the resulting connection from carrying the default route, which would send the
+        VoWiFi tunnel that authenticates this very SIM out through that SIM's own carrier.
+
+        Autoconnect stays off unconditionally: the orchestrator owns the desired state and
+        brings the profile up itself, so NetworkManager acting on its own can only contradict
+        the operator. The default-route guard is what MDD_MODEM_ALLOW_DEFAULT_ROUTE releases,
+        for a deployment whose only uplink really is the modem.
+        """
+        policy = ["connection.autoconnect", "no"]
+        if not MODEM_MAY_PROVIDE_DEFAULT_ROUTE:
+            # never-default is preventive where deleting the route afterwards is corrective:
+            # the route is never installed, so there is no window in which it is live and no
+            # repeated deletion of something already gone. It also reverses with one nmcli
+            # call, which matters on a box reached over the network it is about to reconfigure.
+            policy += ["ipv4.never-default", "yes", "ipv6.never-default", "yes"]
+        return policy
+
     def ensure_modem_data(self, modem: dict, snapshot: dict) -> None:
         """Give each modem its own NetworkManager GSM profile and bearer."""
         if not snapshot.get("powered") or snapshot.get("data_active"):
@@ -1429,7 +1706,10 @@ class Orchestrator:
         if registration not in {"home", "roaming", "registered"}:
             return
         device_id = modem["id"]
-        if time.monotonic() - self.data_attempt_at.get(device_id, 0) < 45:
+        # `None` means "never attempted"; a 0 default would compare against a monotonic clock
+        # that starts near zero at boot and hold back the first dial for 45 seconds of uptime.
+        last_attempt = self.data_attempt_at.get(device_id)
+        if last_attempt is not None and time.monotonic() - last_attempt < 45:
             return
         self.data_attempt_at[device_id] = time.monotonic()
         primary = snapshot.get("primary_port") or snapshot.get("network_interface")
@@ -1443,8 +1723,8 @@ class Orchestrator:
         exists = run(["nmcli", "connection", "show", profile]).returncode == 0
         if not exists:
             command = ["nmcli", "connection", "add", "type", "gsm", "ifname", primary,
-                       "con-name", profile, "connection.autoconnect", "yes",
-                       "connection.autoconnect-retries", "0"]
+                       "con-name", profile, "connection.autoconnect-retries", "0",
+                       *self.modem_profile_policy()]
             if apn:
                 command.extend(["gsm.apn", apn, "gsm.auto-config", "no"])
             else:
@@ -1454,12 +1734,17 @@ class Orchestrator:
                 self.log(f"could not create cellular profile for {device_id}: "
                          f"{(result.stderr or result.stdout).strip()}")
                 return
-        elif apn:
-            # A profile may have been created before the retained bearer APN became visible.
-            result = run(["nmcli", "connection", "modify", profile,
-                          "gsm.apn", apn, "gsm.auto-config", "no"])
+        else:
+            # Re-stamped on every pass, not only at creation: profiles written by an older
+            # version carry autoconnect=yes and no default-route guard, and they outlive the
+            # upgrade. This is the only place that corrects them while data is wanted.
+            command = ["nmcli", "connection", "modify", profile, *self.modem_profile_policy()]
+            if apn:
+                # A profile may have been created before the retained bearer APN became visible.
+                command.extend(["gsm.apn", apn, "gsm.auto-config", "no"])
+            result = run(command)
             if result.returncode:
-                self.log(f"could not update cellular APN for {device_id}: "
+                self.log(f"could not update cellular profile for {device_id}: "
                          f"{(result.stderr or result.stdout).strip()}")
                 return
         result = run(["nmcli", "connection", "up", profile])
@@ -1468,10 +1753,64 @@ class Orchestrator:
                      f"{(result.stderr or result.stdout).strip()}")
 
     def disconnect_modem_data(self, snapshot: dict) -> None:
+        """Take this modem's data profile down and keep it down.
+
+        The profile is addressed by name rather than only by the port it is attached to. A
+        modem in a failed or SIM-less ModemManager state reports no primary port, so matching
+        on the port alone found nothing to do in exactly the state where an autoconnecting
+        profile is most likely to be dialling on its own.
+        """
+        profile = str(snapshot.get("profile") or "")
+        if profile and profile not in self.modem_profile_policed:
+            # Cellular data is off for this modem, so the profile must not come back by
+            # itself -- neither now nor after the next reboot. Once is enough: nothing else
+            # rewrites these properties behind us.
+            if run(["nmcli", "connection", "show", profile]).returncode == 0:
+                run(["nmcli", "connection", "modify", profile, *self.modem_profile_policy()])
+            self.modem_profile_policed.add(profile)
+        active = self._active_gsm_profiles()
         primary = snapshot.get("primary_port") or snapshot.get("network_interface")
-        for name, device in self._active_gsm_profiles():
-            if primary and device == primary:
+        for name, device in active:
+            if name == profile or (primary and device == primary):
                 run(["nmcli", "connection", "down", name])
+
+    def police_orphaned_modem_profiles(self) -> None:
+        """Apply the profile policy to modem profiles nothing else is watching.
+
+        Every ensure/disconnect call sits behind ``through_modemmanager``, which is false
+        whenever no device wants cellular data. So the state an operator reaches by simply
+        turning cellular data off -- ModemManager stood down, the GSM profile left behind --
+        is the one state in which nothing corrects that profile, and a profile written by an
+        earlier version says "autoconnect: forever" in it. That is the most dangerous place
+        to leave it: the operator has said no, nothing is supervising, and NetworkManager
+        still dials on its own the moment the modem enumerates.
+
+        Swept once per stand-down rather than per cycle; profiles are only ever created by
+        ensure_modem_data, which polices them as it goes.
+        """
+        if self.modem_profiles_swept:
+            return
+        self.modem_profiles_swept = True
+        result = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+        if result.returncode:
+            self.modem_profiles_swept = False
+            return
+        for line in (result.stdout or "").splitlines():
+            name, _, kind = line.rpartition(":")
+            name = name.replace(r"\:", ":")
+            if kind != "gsm" or not name.startswith("mdd-cell-"):
+                continue
+            if name in self.modem_profile_policed:
+                continue
+            outcome = run(["nmcli", "connection", "modify", name,
+                           *self.modem_profile_policy()])
+            if outcome.returncode:
+                self.log(f"could not secure leftover cellular profile {name}: "
+                         f"{(outcome.stderr or outcome.stdout).strip()}")
+                continue
+            self.modem_profile_policed.add(name)
+            self.log(f"secured leftover cellular profile {name} "
+                     "(no autoconnect, never the default route)")
 
     def apply_cellular_backend(self, enabled: bool, *, reset_modems: bool = True):
         """Apply the shared cellular backend required by one or more physical modems.
@@ -1646,6 +1985,15 @@ class Orchestrator:
                 if not obj:
                     continue
                 snapshot = self.modem_snapshot(modem)
+                if snapshot.get("state") == "failed":
+                    # Enabling a failed modem only ever answers "Wrong state". Report it
+                    # and recover instead; VoWiFi does not depend on it.
+                    self.recover_failed_modem(modem, snapshot.get("failed_reason") or "unknown",
+                                              wanted=radio_enabled)
+                    snapshot["failure"] = self.modem_failure(device_id)
+                    self.cellular_states[device_id] = snapshot
+                    continue
+                self._modem_failed.pop(device_id, None)
                 observed = snapshot.get("radio_enabled") if snapshot.get("available") else None
                 if observed == radio_enabled:
                     self.radio_states[device_id] = radio_enabled
@@ -1699,7 +2047,7 @@ class Orchestrator:
     def reconcile_timezone(self):
         """Apply the validated WebUI timezone to the host without changing its hostname."""
         try:
-            document = yaml.safe_load((self.data / "config.yaml").read_text()) or {}
+            document = load_yaml_text((self.data / "config.yaml").read_text())
             timezone = str((document.get("settings") or {}).get("timezone") or "").strip()
         except Exception:
             return
@@ -1742,10 +2090,21 @@ class Orchestrator:
                     raise
         if yaml is None:
             raise RuntimeError("PyYAML is required for subscription mode")
-        return yaml.safe_load(cache.read_text(encoding="utf-8")) or {}
+        # The cache only changes on a refresh (every refresh_minutes), but this runs on every
+        # reconcile pass. Keep the parsed document until the file changes; hand out a copy so
+        # the proxy builders can never edit the cached one.
+        stat = cache.stat()
+        key = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        parsed = getattr(self, "_subscription_docs", None)
+        if parsed is None:
+            parsed = self._subscription_docs = {}
+        entry = parsed.get(str(cache))
+        if entry is None or entry[0] != key:
+            entry = parsed[str(cache)] = (key, load_yaml_text(cache.read_text(encoding="utf-8")))
+        return deepcopy(entry[1])
 
-    def xhttp_bridge_outbound(self, node: dict, sing_tag: str, runtime_id: str) -> dict:
-        """Register one loopback-only Xray XHTTP endpoint and return its sing-box detour."""
+    def xray_bridge_outbound(self, node: dict, sing_tag: str, runtime_id: str) -> dict:
+        """Register one loopback-only Xray endpoint and return its sing-box detour."""
         if runtime_id not in self._xray_ports:
             # Stable allocation with collision probing. Ports never leave loopback.
             port = 24000 + int(hashlib.sha256(runtime_id.encode()).hexdigest()[:6], 16) % 1000
@@ -1758,20 +2117,22 @@ class Orchestrator:
                                         "protocol": "socks", "tag": inbound_tag,
                                         "settings": {"auth": "noauth", "udp": True,
                                                      "ip": "127.0.0.1"}})
-            self._xray_outbounds.append(xray_xhttp_outbound(node, outbound_tag))
+            self._xray_outbounds.append(xray_outbound(node, outbound_tag))
             self._xray_rules.append({"type": "field", "inboundTag": [inbound_tag],
                                      "outboundTag": outbound_tag})
         return {"type": "socks", "tag": sing_tag, "version": "5",
                 "server": "127.0.0.1", "server_port": self._xray_ports[runtime_id]}
 
     def node_outbound(self, node: dict, tag: str, runtime_id: str) -> dict:
-        if str(node.get("network") or "").lower() == "xhttp":
-            return self.xhttp_bridge_outbound(node, tag, runtime_id)
+        if node_needs_xray(node):
+            return self.xray_bridge_outbound(node, tag, runtime_id)
         return clash_outbound(node, tag)
 
     def build_proxy_config(self, proxy: dict) -> tuple[dict, dict]:
         inbounds, outbounds, rules, state = [], [], [], {}
         self._xray_inbounds, self._xray_outbounds, self._xray_rules, self._xray_ports = [], [], [], {}
+        # Which countries are carried by Xray, so that Xray failing takes only those down.
+        self._xray_countries = set()
         tun_index = 0
         existing_path = str(proxy.get("existing_singbox_config") or "").strip()
         existing = read_json(Path(existing_path)) if existing_path else {}
@@ -1812,6 +2173,8 @@ class Orchestrator:
                         text = str(value or "").strip()
                         if text.lower().startswith("vless://"):
                             node = parse_share_link(text)
+                            if node_needs_xray(node):
+                                self._xray_countries.add(country)
                             outbound = self.node_outbound(node, tag, profile_id or f"country-{country}")
                         else:
                             outbound = parse_manual_outbound(value, tag)
@@ -1846,6 +2209,8 @@ class Orchestrator:
                     member_names = {}
                     for index, node in enumerate(matches[:32]):
                         member_tag = f"{tag}-{index}"
+                        if node_needs_xray(node):
+                            self._xray_countries.add(country)
                         outbounds.append(self.node_outbound(
                             node, member_tag, f"{subscription_id}-{hashlib.sha256(str(node).encode()).hexdigest()[:12]}"))
                         member_tags.append(member_tag)
@@ -2254,6 +2619,23 @@ class Orchestrator:
         fingerprint = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
         if fingerprint == self.last_proxy_fingerprint and self.singbox and self.singbox.poll() is None:
             return
+        if self.last_proxy_config is not None and self.singbox and self.singbox.poll() is None:
+            resumed_config = deepcopy(self.last_proxy_config)
+            selectors = {outbound.get("tag"): outbound
+                         for outbound in config.get("outbounds") or []
+                         if outbound.get("type") == "selector"}
+            for outbound in resumed_config.get("outbounds") or []:
+                tag = str(outbound.get("tag") or "")
+                current = selectors.get(tag)
+                if (outbound.get("type") == "selector" and tag.startswith("exit-")
+                        and current and current.get("default")
+                        and self.exit_resume.get(tag[len("exit-"):]) == current["default"]):
+                    outbound["default"] = current["default"]
+            if resumed_config == config:
+                atomic_json(self.generated, config)
+                self.last_proxy_fingerprint = fingerprint
+                self.last_proxy_config = deepcopy(config)
+                return
         # Restarting resets every selector to its configured default. Where that default is
         # the node already carrying this country's tunnels the restart is a no-op for the
         # exit, so the memory of it is kept and nothing is ranked: re-ranking there would
@@ -2271,6 +2653,7 @@ class Orchestrator:
         if self.dry_run:
             atomic_json(self.generated, config)
             self.last_proxy_fingerprint = fingerprint
+            self.last_proxy_config = deepcopy(config)
             return
         binary = shutil.which(os.environ.get("MDD_SINGBOX_BIN", "sing-box"))
         if not binary:
@@ -2288,6 +2671,11 @@ class Orchestrator:
             except subprocess.TimeoutExpired: old.kill(); old.wait()
         os.replace(candidate, self.generated)
         self.singbox = subprocess.Popen([binary, "run", "-c", str(self.generated)])
+        # The restore path below relaunches the previous config, whose tuns register the same
+        # way; the union covers whichever of the two ends up running.
+        self.tun_dns_pending |= {str(item.get("interface_name"))
+                                 for item in config.get("inbounds") or []
+                                 if item.get("type") == "tun" and item.get("interface_name")}
         time.sleep(0.8)
         if self.singbox.poll() is not None:
             # Restore and restart the last checked/running config. Routes are kept only after
@@ -2299,6 +2687,37 @@ class Orchestrator:
                 self.singbox = None
             raise RuntimeError("sing-box exited during startup")
         self.last_proxy_fingerprint = fingerprint
+        self.last_proxy_config = deepcopy(config)
+
+    def release_tun_dns(self):
+        """Take the country tuns back out of the host's DNS.
+
+        sing-tun runs ``resolvectl domain <tun> ~.``, ``default-route <tun> true`` and
+        ``dns <tun> <address+1>`` on every tun it brings up, whether or not auto_route is set,
+        and sing-box exposes no option to stop it. On a host resolving through
+        systemd-resolved (Ubuntu desktop and server) that makes the tun the resolver for every
+        name, and nothing answers there: the exits only carry routed ePDG addresses, so the
+        whole host lost DNS the moment an exit was enabled (Discussion #104). Hosts without
+        resolvectl, such as Raspberry Pi OS, never received the registration.
+
+        The registration is made once, asynchronously, shortly after start, so it is looked
+        for on each pass for a bounded time and reverted as soon as it appears.
+        """
+        if self.dry_run or not self.tun_dns_pending:
+            return
+        ctl = shutil.which("resolvectl")
+        if not ctl:
+            self.tun_dns_pending.clear()
+            return
+        for iface in sorted(self.tun_dns_pending):
+            shown = run([ctl, "domain", iface])
+            if shown.returncode == 0 and "~." in shown.stdout.split():
+                run([ctl, "revert", iface])
+                self.tun_dns_pending.discard(iface)
+                self.log(f"removed {iface} from the host DNS configuration "
+                         "(sing-box registers every tun as the catch-all resolver)")
+        if time.time() - self.singbox_started_at > TUN_DNS_WATCH_SECONDS:
+            self.tun_dns_pending.clear()
 
     def apply_xray(self, config: dict | None):
         if not config:
@@ -2318,7 +2737,9 @@ class Orchestrator:
             return
         binary = shutil.which(os.environ.get("MDD_XRAY_BIN", "xray"))
         if not binary:
-            raise RuntimeError("Xray-core executable not found; it is required by XHTTP nodes")
+            raise RuntimeError(
+                "Xray-core executable not found; REALITY and XHTTP nodes are carried by it "
+                "(install it with: sudo ./install.sh reload)")
         candidate = self.xray_generated.with_name("xray.candidate.json")
         atomic_json(candidate, config)
         check = run([binary, "run", "-test", "-config", str(candidate)])
@@ -2407,8 +2828,22 @@ class Orchestrator:
             config, exits_state = self.build_proxy_config(proxy)
             configured = [x for x in exits_state.values() if x.get("mode") != "direct" and x.get("ready")]
             if configured:
-                self.apply_xray(self.next_xray_config)
-                self.apply_singbox(config)
+                # REALITY made Xray load-bearing for ordinary exits, where it used to matter
+                # only to the rare XHTTP node. Letting its failure escape here took every
+                # country down with it — including exits that never touch Xray. Only the
+                # countries it actually carries are failed; the rest still get their routes.
+                try:
+                    self.apply_xray(self.next_xray_config)
+                except Exception as exc:
+                    for country in self._xray_countries:
+                        if country in exits_state:
+                            exits_state[country] = {**exits_state[country], "ready": False,
+                                                    "error": f"Xray is unavailable: {exc}"}
+                    self.log(f"Xray failed; {len(self._xray_countries)} exit(s) affected: {exc}")
+                try:
+                    self.apply_singbox(config)
+                finally:
+                    self.release_tun_dns()
             else:
                 self.apply_xray(None)
             # Ranking must come first: update_selected_nodes then reports the node this cycle
@@ -2451,6 +2886,12 @@ class Orchestrator:
         except Exception as exc:
             for line in desired.get("lines") or []:
                 lines_status[str(line.get("id"))] = {"ready": False, "error": str(exc)}
+            # build_proxy_config marks an exit ready once its config renders; a sing-box that
+            # then refused to start leaves no listener behind it. Publishing those exits as
+            # ready sent the UDP test at a socket nobody was serving and blamed the node.
+            for country, state in exits_state.items():
+                if state.get("mode") != "direct" and state.get("ready"):
+                    exits_state[country] = {**state, "ready": False, "error": str(exc)}
         atomic_json(self.status_path, {"updated_at": int(time.time()), "enabled": True,
                                        "exits": exits_state, "lines": lines_status})
 
@@ -2651,6 +3092,21 @@ class Orchestrator:
                  "it collides with this gateway's per-modem virtual readers")
         return True
 
+    @staticmethod
+    def reader_config_unreadable(config_path: Path) -> bool:
+        """Whether an unprivileged pcscd would be unable to read the reader definitions.
+
+        This service runs with UMask=0077, so a freshly created definition file is 0600
+        root. pcscd running as root never noticed; distributions whose pcscd.service drops
+        to its own user (Ubuntu 26.04) silently skip the file and no modem reader appears.
+        Files written by earlier releases keep that mode, and their content already matches,
+        so the mode has to be checked on its own for an upgrade to repair them.
+        """
+        try:
+            return (config_path.stat().st_mode & 0o044) != 0o044
+        except OSError:
+            return False
+
     def reconcile_hardware(self, desired: dict, desired_devices: dict,
                            through_modemmanager=False) -> dict:
         hardware = (desired.get("hardware") or {})
@@ -2670,6 +3126,7 @@ class Orchestrator:
                           if device_id in live_ids}
         self._bridge_failures = {device_id: value for device_id, value
                                  in self._bridge_failures.items() if device_id in live_ids}
+        self.forget_absent_modem_failures(live_ids)
         old = read_json(self.hw_state_path).get("assignments") or {}
         ports = [BASE_VPCD_PORT + i * VPCD_PORT_STRIDE for i in range(VPCD_PORT_SLOTS)]
         # A port saved by a release that started at vpcd's own default is migrated here:
@@ -2704,10 +3161,12 @@ class Orchestrator:
         legacy_config = config_path.with_name("vowifi-modems")
         legacy_present = legacy_config.exists() and legacy_config != config_path
         distro_disabled = self.disable_distro_vpcd_reader(config_path)
-        if reader_config != self.last_reader_config or distro_disabled:
+        unreadable = self.reader_config_unreadable(config_path)
+        if reader_config != self.last_reader_config or distro_disabled or unreadable:
             if not self.dry_run:
                 config_path.parent.mkdir(parents=True, exist_ok=True)
                 config_path.write_text(reader_config, encoding="utf-8")
+                os.chmod(config_path, 0o644)
                 if legacy_present:
                     legacy_config.unlink(missing_ok=True)
                 (self.root / "pcsc-maintenance").write_text(str(int(time.time())), encoding="ascii")
@@ -2818,11 +3277,12 @@ class Orchestrator:
             # hardware lives beside proxy in settings; desired v1 publishers may omit it.
             if not desired.get("hardware"):
                 try:
-                    conf = yaml.safe_load((self.data / "config.yaml").read_text()) or {}
+                    conf = load_yaml_text((self.data / "config.yaml").read_text())
                     desired["hardware"] = (conf.get("settings") or {}).get("hardware") or {}
                 except Exception:
                     pass
             discovered = self.usb_modems(desired.get("hardware") or {})
+            self.reconcile_usb_candidates(desired.get("hardware") or {})
             self.migrate_device_ids(discovered)
             desired_devices, _migrated = self.desired_devices(discovered)
             present_ids = {modem["id"] for modem in discovered}
@@ -2875,6 +3335,11 @@ class Orchestrator:
 
             self.apply_device_radios(discovered, active_desired,
                                      through_modemmanager=cellular_required)
+            if cellular_required:
+                self.modem_profiles_swept = False
+            else:
+                # Nothing above ran: every data path is gated on the backend being up.
+                self.police_orphaned_modem_profiles()
             # Country egress only exists to carry VoWiFi IKE/ePDG traffic.
             proxy_desired = desired
             if not vowifi_required:
@@ -2899,12 +3364,28 @@ class Orchestrator:
             self._last_conclusion = fingerprint
             self._sleep_for_work(IDLE_INTERVAL_SECONDS if idle else self.interval)
 
+    def reconcile_usb_candidates(self, hardware: dict):
+        """Publish unrecognised modem-like USB devices and run any test the operator asked for.
+
+        Tests run here, before bridges are reconciled, and only on request: sending AT to a
+        serial port nobody identified is never done on the gateway's own initiative.
+        """
+        if self.dry_run:
+            return
+        known = {(str(p.get("vid", "")).lower(), str(p.get("pid", "")).lower())
+                 for p in hardware.get("modem_profiles") or [] if isinstance(p, dict)}
+        try:
+            candidates = self.usb_candidates.scan(known, run)
+            self.modem_probes.process(candidates, log=self.log)
+        except Exception as exc:  # never let discovery of extras stop the known modems
+            self.log(f"USB candidate scan failed: {exc}")
+
     def _input_mtimes(self) -> tuple:
         """Cheap change detector for the documents an operator action writes."""
         stamps = []
         for path in (self.desired_path, self.device_desired_path,
                      self.data / "config.yaml", self.reselect_path,
-                     self.bridge_restart_request_dir):
+                     self.bridge_restart_request_dir, self.modem_probes.request_dir):
             try:
                 stamps.append(path.stat().st_mtime)
             except OSError:

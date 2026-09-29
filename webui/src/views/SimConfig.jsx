@@ -5,7 +5,7 @@ import { useI18n } from '../i18n.jsx'
 const emptyInstance = () => ({
   id: '', name: '', imsi: '', mcc: '', mnc: '', imei: '', imeisv: '', pin: '', reader: '', proxy_country: '',
   reader_index: 0, reader_port: '', msisdn: '', smsc: '', enabled: true, apn: 'ims', idr_mode: 'apn', cp_mode: 'auto',
-  sip: { listen_addr: '0.0.0.0', webrtc: { enable: true } },
+  sip: { webrtc: { enable: true } },
   debug: { asterisk: false, charon: false },
 })
 
@@ -23,6 +23,7 @@ function nextInstanceId(instances) {
 export default function SimConfig({ instances, selected, refresh, cards, setSelected, targetDevice }) {
   const { t } = useI18n()
   const [readers, setReaders] = useState([])
+  const [readersLoading, setReadersLoading] = useState(true)
   const [card, setCard] = useState(null)
   const [pin, setPin] = useState('')
   const [pinMsg, setPinMsg] = useState('')
@@ -35,7 +36,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   const [smscMode, setSmscMode] = useState('auto')   // 'auto' = read from SIM, 'manual' = typed
   // Only to label the "use the system default" option with what that default currently is,
   // so the choice does not require a trip to the settings page to interpret.
-  const [systemDefaultVm, setSystemDefaultVm] = useState(false)
+  const [systemDefaultVm, setSystemDefaultVm] = useState(null)
   useEffect(() => {
     let cancelled = false
     api.settings().then((s) => { if (!cancelled) setSystemDefaultVm(!!s.vm_enabled) })
@@ -55,15 +56,18 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       .sort((a, b) => a.index - b.index)
       .map((item) => item.name)
     const load = async () => {
+      if (!readers.length) setReadersLoading(true)
       try {
         const result = await api.readers()
         if (cancelled) return
         const next = Array.isArray(result.readers) ? result.readers : []
         setReaders((previous) => next.length ? next : previous.length ? previous : cached)
+        setReadersLoading(false)
         if (result.stale) retryTimer = setTimeout(load, 2000)
       } catch {
         if (cancelled) return
         setReaders((previous) => previous.length ? previous : cached)
+        setReadersLoading(false)
         retryTimer = setTimeout(load, 2000)
       }
     }
@@ -133,38 +137,45 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   // re-enumerates two identical readers in a different order.
   const portForIdx = (i) => (cards.find((c) => c.index === i) || {}).reader_port || ''
 
+  const applyCard = (c) => {
+    setCard(c)
+    if (!c.present) {
+      setPinMsg(t('No SIM card in this reader.'))
+      return
+    }
+    const patch = { imsi: c.imsi || form.imsi, mcc: c.mcc || form.mcc, mnc: c.mnc || form.mnc }
+    if (c.smsc && smscMode === 'auto') patch.smsc = c.smsc   // SMSC from the SIM (EF_SMSP)
+    if (c.imsi) patch.reader = `imsi:${c.imsi}`
+    // Bind the line to the reader's stable physical USB port (from the detected card, else the
+    // live monitor). Persisted so start-time re-resolves the correct index for this socket.
+    const port = c.reader_port || portForIdx(readerIdx())
+    if (port) patch.reader_port = port
+    if (!form.id) patch.id = nextInstanceId(instances)
+    upd(patch)
+    if (c.imsi) setPinMsg(t('Card read.'))
+    else if (c.error) setPinMsg(t('Card error: {error}', { error: c.error }))
+    else setPinMsg(t('Card present; enter PIN to read IMSI. ICCID {iccid}, {tries} tries left.', { iccid: c.iccid || '?', tries: c.pin_tries ?? '?' }))
+  }
+
   const detect = async () => {
     setPinMsg(t('Detecting…'))
     try {
-      const c = await api.detect(readerIdx())
-      setCard(c)
-      if (!c.present) {
-        setPinMsg(t('No SIM card in this reader.'))
-        return
-      }
-      const patch = { imsi: c.imsi || form.imsi, mcc: c.mcc || form.mcc, mnc: c.mnc || form.mnc }
-      if (c.smsc && smscMode === 'auto') patch.smsc = c.smsc   // SMSC from the SIM (EF_SMSP)
-      if (c.imsi) patch.reader = `imsi:${c.imsi}`
-      // Bind the line to the reader's stable physical USB port (from the detected card, else the
-      // live monitor). Persisted so start-time re-resolves the correct index for this socket.
-      const port = c.reader_port || portForIdx(readerIdx())
-      if (port) patch.reader_port = port
-      if (!form.id) patch.id = nextInstanceId(instances)
-      upd(patch)
-      setPinMsg(c.imsi ? t('Card read.') : t('Card present; enter PIN to read IMSI. ICCID {iccid}, {tries} tries left.', { iccid: c.iccid || '?', tries: c.pin_tries ?? '?' }))
+      applyCard(await api.detect(readerIdx()))
     } catch (e) { setPinMsg(`${t('Error')}: ${e.message}`) }
   }
 
   const verifyPin = async () => {
     setPinMsg(t('Verifying…'))
     try {
-      const r = await api.verifyPin(pin, readerIdx())
-      setPinMsg(r.ok ? t('PIN OK ✓') : t('PIN failed: {error} ({tries} tries left)', { error: r.error, tries: r.tries }))
+      const r = await api.verifyPin(pin, readerIdx(), readers[readerIdx()], portForIdx(readerIdx()))
       if (r.ok) {
-        const p = { pin }
-        if (r.card?.smsc && smscMode === 'auto') p.smsc = r.card.smsc   // now-readable SMSC from SIM
-        upd(p)
-        await detect()
+        upd({ pin })
+        // The backend already re-read the card with the PIN in the same request (r.card).
+        // Re-detecting here would open a fresh no-PIN connection and lock the card again.
+        if (r.card) applyCard(r.card)
+        setPinMsg(t('PIN OK ✓'))
+      } else {
+        setPinMsg(t('PIN failed: {error} ({tries} tries left)', { error: r.error, tries: r.tries }))
       }
     } catch (e) { setPinMsg(`${t('Error')}: ${e.message}`) }
   }
@@ -177,7 +188,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       if (editedNumber) body.msisdn_source = String(form.msisdn || '').trim() ? 'manual' : ''
       // Strip runtime-only fields that ride along on the instance object from /api/instances
       // (they are computed per-request, not config — never persist them).
-      delete body.status; delete body.has_pin
+      delete body.status; delete body.has_pin; delete body.proxy_country_effective; delete body.sip_carrier_defaults
       // Never send an empty PIN — the stored PIN (tied to this IMSI) must survive edits to
       // unrelated fields. `pin` state is only set when the user re-enters/verifies a PIN
       // here; only then do we forward it to update the saved credential.
@@ -192,8 +203,8 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         setCreating(false)
         setSelected(String(res.instance.id))
       }
-      // A running line is restarted server-side to apply the new config (pjsip accounts,
-      // IMEI, SMSC, User-Agent…); a stopped line just saves.
+      // Runtime configuration changes restart a running line server-side so Asterisk/IKE can
+      // apply them. A display-name-only edit is metadata and saves without interrupting it.
       setPinMsg(t(creating ? 'Line created and starting…' : res?.applied ? 'Saved — restarting the line to apply changes…' : 'Saved.'))
     } catch (e) { alert(e.message) }
     setSaving(false)
@@ -235,7 +246,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   }
 
   const missing = targetDevice?.provisioning?.missing || []
-  const missingLabels = { imsi: 'IMSI / PIN', imei: 'IMEI', smsc: t('SMS centre (SMSC)') }
+  const missingLabels = { imsi: 'IMSI / PIN', imei: 'IMEI', smsc: t('SMS centre (SMSC)'), mcc_mnc: 'MCC/MNC', pin: t('setup.field.pin') }
   const imeiReady = String(targetDevice?.imei || '').replace(/[^0-9]/g, '').length === 15
   const existingLine = instances.some(line => String(line.id) === String(form.id))
 
@@ -265,7 +276,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         <Field label={t('Reader')}>
           <select value={form.reader_index} disabled={!!targetDevice} onChange={(e) => upd({ reader_index: +e.target.value, reader_port: portForIdx(+e.target.value) || form.reader_port })}>
             {readers.map((r, i) => <option key={i} value={i}>{i}: {r}{portForIdx(i) ? ` — USB ${portForIdx(i)}` : ''}</option>)}
-            {readers.length === 0 && <option>{t('No readers')}</option>}
+            {readers.length === 0 && <option>{readersLoading ? `${t('Loading')}…` : t('No readers')}</option>}
           </select>
         </Field>
         {form.reader_port &&
@@ -381,7 +392,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
           onChange={(e) => updSip({ vm_enabled: e.target.value === 'default' ? undefined
             : e.target.value === 'on' })}>
           <option value="default">{t('Use the system default ({state})',
-            { state: systemDefaultVm ? t('on') : t('off') })}</option>
+            { state: systemDefaultVm === null ? `${t('Loading')}…` : systemDefaultVm ? t('on') : t('off') })}</option>
           <option value="on">{t('On for this line')}</option>
           <option value="off">{t('Off for this line')}</option>
         </select>
@@ -399,11 +410,44 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
                 placeholder={t('Automatic carrier default')} />
             </Field>
           </div>
-          <label style={{ marginTop: 8 }}>
-            <input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={!!form.sip.user_eq_phone}
-              onChange={(e) => updSip({ user_eq_phone: e.target.checked })} />
-            {t('Add ;user=phone to telephone-number SIP requests')}
-          </label>
+          <Field label={t('Device User-Agent (how the line identifies to the carrier)')}>
+            <input className="mono" maxLength={64} value={form.sip.user_agent || ''}
+              onChange={(e) => updSip({ user_agent: e.target.value })}
+              placeholder="MDD-Sim-Gateway" />
+            <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 2 }}>
+              {t('Leave empty to identify as MDD-Sim-Gateway. Set this only when the carrier rejects registration from an unrecognised terminal.')}
+            </div>
+          </Field>
+          {/* The endpoint-wide switch is superseded by the call-only parameters below. It stays
+              visible only on a line where someone turned it on by hand, so it can be turned off;
+              a carrier default (O2) keeps working without being shown twice. */}
+          {form.sip.user_eq_phone === true && !(form.sip_carrier_defaults || {}).user_eq_phone &&
+            <label style={{ marginTop: 8 }}>
+              <input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked
+                onChange={(e) => updSip({ user_eq_phone: e.target.checked })} />
+              {t('Add ;user=phone to every SIP request, SMS included (older setting; the call-only option below replaces it)')}
+            </label>}
+          {(() => {
+            // A setting the line leaves unset follows the carrier profile, so show that value.
+            const carrier = form.sip_carrier_defaults || {}
+            const enabled = form.sip.invite_uri_params_enable ?? !!carrier.invite_uri_params_enable
+            return <>
+              <label style={{ marginTop: 8 }}>
+                <input type="checkbox" style={{ width: 'auto', marginRight: 8 }} checked={enabled}
+                  onChange={(e) => updSip({ invite_uri_params_enable: e.target.checked })} />
+                {t('Add parameters to the request URI of outgoing calls')}
+              </label>
+              {enabled && <Field label={t('Request URI parameters')}>
+                <input className="mono" maxLength={128}
+                  value={form.sip.invite_uri_params ?? carrier.invite_uri_params ?? ''}
+                  onChange={(e) => updSip({ invite_uri_params: e.target.value })}
+                  placeholder="user=phone" />
+                <div style={{ fontSize: 11, color: 'var(--text-mute)', marginTop: 2 }}>
+                  {t('Outgoing calls only; SMS is not affected. Separate several parameters with ;.')}
+                </div>
+              </Field>}
+            </>
+          })()}
         </details>
 
         <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>

@@ -1,9 +1,26 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from control.app import config, engine, main
+
+
+_lifecycle_patcher = None
+
+
+def setUpModule():
+    # Lifecycle persistence itself is covered against a TemporaryDirectory below. Other tests
+    # exercise policy decisions and must never write their fictional line ids into repo data.
+    global _lifecycle_patcher
+    _lifecycle_patcher = patch.object(main, "_record_lifecycle")
+    _lifecycle_patcher.start()
+
+
+def tearDownModule():
+    if _lifecycle_patcher is not None:
+        _lifecycle_patcher.stop()
 
 
 class DeletedCardSuppressionTests(unittest.TestCase):
@@ -29,6 +46,60 @@ class DeletedCardSuppressionTests(unittest.TestCase):
                 self.assertTrue(engine.delete_instance_data("line-1"))
             self.assertFalse(target.parent.exists())
             self.assertTrue((other / "keep").exists())
+
+    def test_lifecycle_records_are_bounded_and_reject_free_text(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(engine, "DATA_DIR", temp), \
+                patch.object(engine, "HOST_DATA_DIR", temp), \
+                patch.object(engine, "LIFECYCLE_RECORDS", 3):
+            Path(temp, "instances", "line-1", "logs").mkdir(parents=True)
+            for index in range(5):
+                engine.record_lifecycle(
+                    "line-1", "recovery_failed", reason_code="engine_start_failed",
+                    retry_count=index, card_present=True)
+            path = Path(temp, "instances", "line-1", "logs", "lifecycle.jsonl")
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            with self.assertRaises(ValueError):
+                engine.record_lifecycle(
+                    "line-1", "recovery_failed", reason_code="path=/private/secret")
+            with self.assertRaises(ValueError):
+                engine.record_lifecycle(
+                    "../outside", "recovery_failed", reason_code="engine_start_failed")
+
+        self.assertEqual(len(records), 3)
+        self.assertEqual([item["retry_count"] for item in records], [2, 3, 4])
+        self.assertEqual(set(records[-1]), {
+            "ts", "instance", "event", "reason_code", "retry_count", "card_present"})
+
+    def test_lifecycle_keeps_the_sip_status_that_condemned_the_line(self):
+        # Issue #33: a reg_rejected freeze reached the support bundle without the SIP code
+        # that caused it, because every log holding it had already rotated.
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(engine, "DATA_DIR", temp), \
+                patch.object(engine, "HOST_DATA_DIR", temp):
+            Path(temp, "instances", "line-1", "logs").mkdir(parents=True)
+            engine.record_lifecycle(
+                "line-1", "recovery_scheduled", reason_code="reg_rejected",
+                delay_seconds=120, sip_status=403)
+            engine.record_lifecycle(
+                "line-1", "recovery_scheduled", reason_code="reg_rejected",
+                delay_seconds=120, sip_status=None)
+            engine.record_lifecycle(
+                "line-1", "recovery_scheduled", reason_code="reg_rejected",
+                delay_seconds=120, sip_status=12345)
+            path = Path(temp, "instances", "line-1", "logs", "lifecycle.jsonl")
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(records[0]["sip_status"], 403)
+        self.assertNotIn("sip_status", records[1])
+        self.assertEqual(records[2]["sip_status"], 999)
+
+    def test_lifecycle_never_recreates_a_deleted_instance_directory(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(engine, "DATA_DIR", temp), \
+                patch.object(engine, "HOST_DATA_DIR", temp):
+            engine.record_lifecycle(
+                "deleted", "recovery_cancelled", reason_code="line_deleted")
+            self.assertFalse(Path(temp, "instances", "deleted").exists())
 
 
 class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
@@ -125,20 +196,94 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 main._line_auto_start_allowed(inst), (False, "vowifi_disabled"))
 
-    async def test_auto_recovery_does_not_recreate_an_absent_line(self):
+    def test_new_device_default_does_not_disable_an_enabled_native_reader_line(self):
+        inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
+        card = {"present": True, "iccid": "saved-card", "name": "USB reader",
+                "reader_port": "usb:1-2", "hardware_kind": "reader"}
+        desired = {"defaults": {"vowifi_enabled": False}, "devices": {}}
+        with patch.object(main.hub, "cards_list", return_value=[card]), \
+                patch.object(main, "_device_for_card", return_value=("reader-1", "reader")), \
+                patch.object(main.device_state, "desired", return_value=desired) as read_desired:
+            self.assertEqual(main._line_auto_start_allowed(inst), (True, ""))
+        read_desired.assert_not_called()
+
+    async def test_auto_recovery_rechecks_a_transiently_absent_card(self):
         inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
         main.hub.health_for("offline").update({
             "frozen_code": "tunnel_sim_auth", "frozen_reason": "failed",
-            "auto_retrying": True,
+            "auto_retrying": True, "retry_count": 3,
         })
+        started = main.time.monotonic()
         with patch.object(main, "_line_auto_start_allowed",
                           return_value=(False, "no_card")), \
                 patch.object(main, "_start_engine_checked") as start, \
+                patch.object(main, "_record_lifecycle") as lifecycle, \
                 patch.object(main.hub, "broadcast", new=AsyncMock()):
             await main._auto_recover_instance("offline", inst, 60)
 
         start.assert_not_called()
         self.assertEqual(main.hub.status_cache["offline"]["state"], "NO_CARD")
+        health = main.hub.health["offline"]
+        self.assertEqual(health["frozen_code"], "tunnel_sim_auth")
+        self.assertFalse(health["auto_retrying"])
+        self.assertGreaterEqual(health["next_retry_at"], started + 60)
+        lifecycle.assert_called_once_with(
+            "offline", "recovery_blocked", "no_card", retry_count=3,
+            delay_seconds=60, card_present=False)
+
+        # The sampled cache can remain absent for hours. Rechecks re-arm recovery but must not
+        # fill the bounded audit with an identical blocked record every cooldown.
+        health["auto_retrying"] = True
+        await main._auto_recover_instance("offline", inst, 60)
+        lifecycle.assert_called_once()
+
+    async def test_disabled_vowifi_still_cancels_pending_recovery(self):
+        inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
+        main.hub.health_for("offline").update({
+            "frozen_code": "tunnel_network", "frozen_reason": "failed",
+            "auto_retrying": True, "next_retry_at": 12345,
+        })
+        with patch.object(main, "_line_auto_start_allowed",
+                          return_value=(False, "vowifi_disabled")), \
+                patch.object(main, "_start_engine_checked") as start, \
+                patch.object(main, "_record_lifecycle") as lifecycle, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()):
+            await main._auto_recover_instance("offline", inst, 60)
+
+        start.assert_not_called()
+        health = main.hub.health["offline"]
+        self.assertIsNone(health["frozen_code"])
+        self.assertIsNone(health["next_retry_at"])
+        self.assertEqual(main.hub.status_cache["offline"]["state"], "STOPPED")
+        lifecycle.assert_called_once_with(
+            "offline", "recovery_cancelled", "vowifi_disabled",
+            retry_count=0, card_present=True)
+
+    async def test_hardware_imei_recovery_failure_is_structured_without_exception_text(self):
+        inst = {"id": "offline", "iccid": "saved-card", "enabled": True,
+                "imei_source_device_id": "modem-a"}
+        main.hub.health_for("offline").update({
+            "frozen_code": "tunnel_network", "frozen_reason": "failed",
+            "auto_retrying": True, "retry_count": 3,
+        })
+        failure = main.HTTPException(409, {
+            "code": "hardware_imei_required",
+            "message": "private path /dev/ttyUSB2 and 123456789012345",
+            "device_id": "modem-a",
+        })
+        with patch.object(main, "_line_auto_start_allowed", return_value=(True, "")), \
+                patch.object(main, "_start_engine_checked", side_effect=failure), \
+                patch.object(main, "_record_lifecycle") as lifecycle, \
+                patch.object(main.hub, "broadcast", new=AsyncMock()):
+            await main._auto_recover_instance("offline", inst, 60)
+
+        self.assertEqual(lifecycle.call_count, 2)
+        failed = lifecycle.call_args_list[-1]
+        self.assertEqual(failed.args, (
+            "offline", "recovery_failed", "hardware_imei_required"))
+        self.assertEqual(failed.kwargs["imei_valid"], False)
+        self.assertEqual(failed.kwargs["imei_source_matches"], True)
+        self.assertNotIn("private", str(failed))
 
     async def test_card_removal_cancels_a_pending_recovery_without_a_container(self):
         inst = {"id": "removed", "iccid": "saved-card"}
@@ -149,6 +294,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
                  "iccid": "saved-card"}
         with patch.object(main.cfg, "unsuppress_card"), \
                 patch.object(main.cfg, "get_instance", return_value=inst), \
+                patch.object(main, "_record_lifecycle") as lifecycle, \
                 patch.object(main.engine, "is_running", return_value=False):
             stopped = await main._on_card_remove(entry)
 
@@ -156,6 +302,9 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         health = main.hub.health["removed"]
         self.assertIsNone(health["frozen_code"])
         self.assertIsNone(health["next_retry_at"])
+        lifecycle.assert_called_once_with(
+            "removed", "recovery_cancelled", "no_card",
+            retry_count=0, card_present=False)
 
     async def test_maintenance_restart_only_recreates_the_running_snapshot(self):
         running = {"id": "1", "enabled": True}
@@ -309,6 +458,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         main.hub.reset_health("guarded")
 
     async def test_unanswered_fast_recovery_is_rate_limited_per_line(self):
+        main._record_lifecycle.reset_mock()
         iid = "rate-limited"
         main.hub.reset_health(iid)
         main.hub.reg_unanswered_recovery_at[iid] = main.time.monotonic()
@@ -363,6 +513,14 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(capture_and_stop.call_args.args[0], "3")
         self.assertIn("reg_rejected", capture_and_stop.call_args.args[2])
         self.assertIsNone(capture_and_stop.call_args.args[3])
+        main._record_lifecycle.assert_called_once()
+        lifecycle_call = main._record_lifecycle.call_args
+        self.assertEqual(
+            lifecycle_call.args,
+            ("3", "recovery_scheduled", "reg_rejected"))
+        self.assertEqual(lifecycle_call.kwargs["retry_count"], 3)
+        self.assertGreaterEqual(lifecycle_call.kwargs["delay_seconds"], 119)
+        self.assertLessEqual(lifecycle_call.kwargs["delay_seconds"], 120)
         # The exit is NOT asked to move. A carrier that answers registration with a rejection
         # says nothing about the path its packets took, and moving on that evidence is what
         # made a healthy pool churn: measured over fifty freezes, the node blamed most often
@@ -465,6 +623,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
             "frozen_code": "registering", "frozen_reason": "IMS unavailable",
             "next_retry_at": main.time.monotonic() + 1, "last_state": "REGISTERING",
         }
+        main._record_lifecycle.reset_mock()
         with patch.object(main.engine, "stop") as stop, \
                 patch.object(main.hub, "drop_ami", new=AsyncMock()) as drop_ami:
             await main.api_instance_stop("stop-test")
@@ -474,6 +633,9 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main.hub.status_cache["stop-test"]["state"], "STOPPED")
         stop.assert_called_once_with("stop-test")
         drop_ami.assert_awaited_once_with("stop-test")
+        main._record_lifecycle.assert_called_once_with(
+            "stop-test", "recovery_cancelled", "user_requested",
+            retry_count=3, card_present=None)
         main.hub.reset_health("stop-test")
 
     async def test_unknown_registration_only_holds_ok_for_bounded_grace(self):
@@ -523,8 +685,9 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "get_settings", return_value={
                     "proxy": {"exits": {}}, "rekey": {"minutes": 30}}), \
                 patch.object(main, "_cached_line_status", return_value=None), \
-                patch.object(main.egress, "status", return_value={"lines": {}}), \
-                patch.object(main.egress, "line_country", return_value="GB"), \
+                patch.object(main.egress, "status", return_value={
+                    "exits": {"gb": {"ready": True, "node": "London container exit"}}}), \
+                patch.object(main.egress, "line_country", return_value="gb"), \
                 patch.object(main.egress, "country_for_mcc", return_value="GB"):
             devices = await main._unified_devices()
 
@@ -536,6 +699,41 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(device["sim"]["carrier"]["plmn"], "234-10")
         self.assertEqual(device["instance_id"], "3")
         self.assertEqual(device["capabilities"]["cellular"]["actual"], "on")
+        self.assertEqual(device["egress"]["node"], "London container exit")
+
+    async def test_modem_with_working_4g_and_a_carrier_without_vowifi(self):
+        """The device-wide VoWiFi switch stayed on over a line provisioned disabled, so a
+        China Telecom SIM with working 4G read "enabled but no configured line is running"."""
+        desired = {"devices": {"modem-a": {
+            "cellular_enabled": True, "vowifi_enabled": True, "flight_mode": False}}}
+        observed = {"devices": {"modem-a": {
+            "present": True,
+            "actual": {"cellular_radio_enabled": True, "vowifi_bridge_active": True},
+            "cellular": {"available": True, "sim_iccid": "ct-card",
+                         "registration": "home", "operator": "CHN-CT",
+                         "radio_enabled": True, "data_active": True}}}}
+        line = {"id": "6", "name": "460-11-2964", "iccid": "ct-card",
+                "mcc": "460", "mnc": "11", "enabled": False}
+        with patch.object(main, "_device_sources", return_value=(desired, observed, {})), \
+                patch.object(main, "_device_identities", return_value={}), \
+                patch.object(main.hub, "cards_list", return_value=[]), \
+                patch.object(main.cfg, "list_instances", return_value=[line]), \
+                patch.object(main.device_state, "native_reader_devices", return_value={}), \
+                patch.object(main.device_state, "hardware", return_value={}), \
+                patch.object(main.cfg, "get_settings", return_value={
+                    "proxy": {"exits": {}}, "rekey": {"minutes": 30}}), \
+                patch.object(main, "_cached_line_status", return_value={"state": "STOPPED"}), \
+                patch.object(main.egress, "status", return_value={"exits": {}}), \
+                patch.object(main.egress, "line_country", return_value="cn"), \
+                patch.object(main.egress, "country_for_mcc", return_value="CN"):
+            devices = await main._unified_devices()
+
+        caps = devices[0]["capabilities"]
+        self.assertEqual(caps["cellular"]["actual"], "on")
+        self.assertFalse(caps["vowifi"]["desired"])
+        self.assertEqual(caps["vowifi"]["actual"], "off")
+        self.assertEqual(caps["vowifi"]["support"]["status"], "unsupported")
+        self.assertIn("Mainland China", caps["vowifi"]["reason"])
 
     async def test_saved_unplugged_modem_never_looks_like_it_is_transitioning(self):
         desired = {"devices": {"modem-a": {
@@ -834,6 +1032,35 @@ class ImeiSourceFollowsReaderTests(unittest.TestCase):
         self.assertTrue(all(item["imei_source_device_id"] for item in saved))
 
 
+class HardwareImeiRecoveryTests(unittest.TestCase):
+    CARD = {"iccid": "8900000000000000001"}
+
+    def _resolve(self, inst):
+        with patch.object(main, "_device_for_card", return_value=("modem-a", "modem")), \
+                patch.object(main, "_device_identities",
+                             return_value={"modem-a": {"imei": ""}}), \
+                patch.object(main, "_match_instance_by_iccid", return_value=inst):
+            return main._hardware_imei_for_card(self.CARD, [self.CARD])
+
+    def test_rebuild_does_not_reuse_a_modem_imei_from_a_port_based_id(self):
+        resolved = self._resolve({
+            "imei": "123456789012345", "imei_source_device_id": "modem-a"})
+        self.assertEqual(resolved, ("", "modem-a", "modem"))
+
+    def test_rebuild_never_borrows_an_imei_from_another_modem(self):
+        resolved = self._resolve({
+            "imei": "123456789012345", "imei_source_device_id": "modem-b"})
+        self.assertEqual(resolved, ("", "modem-a", "modem"))
+
+    def test_reader_rebuild_also_reuses_its_verified_line_snapshot(self):
+        inst = {"imei": "123456789012345", "imei_source_device_id": "reader-a"}
+        with patch.object(main, "_device_for_card", return_value=("reader-a", "reader")), \
+                patch.object(main.device_state, "hardware", return_value={}), \
+                patch.object(main, "_match_instance_by_iccid", return_value=inst):
+            resolved = main._hardware_imei_for_card(self.CARD, [self.CARD])
+        self.assertEqual(resolved, ("123456789012345", "reader-a", "reader"))
+
+
 class OutageDetailTests(unittest.TestCase):
     """The outage record must name the evidence, not just the verdict."""
 
@@ -886,25 +1113,32 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
     and if giving up really stops the rebuild instead of merely saying so."""
 
     EXITS = {"exits": {"us": {"node": "node-a", "candidates": ["node-a", "node-b"],
-                              "selection": "auto"}}}
+                              "selection": "auto", "mode": "subscription"}}}
     INST = {"id": "9", "enabled": True, "mcc": "310", "mnc": "240", "name": "test"}
 
     def setUp(self):
         main.hub.exit_ledgers.pop("9", None)
         main.hub.reset_health("9")
+        settings = patch.object(main.cfg, "get_settings", return_value={"proxy": {"enabled": True}})
+        settings.start()
+        self.addCleanup(settings.stop)
+        stalled = patch.object(main.egress, "report_stalled_exit")
+        self.stalled = stalled.start()
+        self.addCleanup(stalled.stop)
 
     def tearDown(self):
         main.hub.exit_ledgers.pop("9", None)
         main.hub.reset_health("9")
 
-    def _judge(self, swu, retransmits, exits=None, stable_for=0.0, peers=()):
-        st = {"reason_code": "tunnel_network", "reason": "x"}
+    def _judge(self, swu, retransmits, exits=None, stable_for=0.0, peers=(),
+               reason="tunnel_network", evidence_error=None):
+        st = {"reason_code": reason, "reason": "x"}
         with patch.object(main.egress, "line_country", return_value="us"), \
-                patch.object(main.egress, "status", return_value=exits or self.EXITS), \
+                patch.object(main.egress, "status", return_value=self.EXITS if exits is None else exits), \
                 patch.object(main.cfg, "list_instances", return_value=list(peers)), \
                 patch.object(main.engine, "read_run_json", return_value={"state": swu}), \
                 patch.object(main.engine, "ike_evidence",
-                             return_value={"retransmits": retransmits}), \
+                             return_value={"retransmits": retransmits}, side_effect=evidence_error), \
                 patch.object(main, "_save_exit_ledgers"), \
                 patch.object(main.egress, "request_reselect") as reselect, \
                 patch.object(main.asyncio, "to_thread", new=AsyncMock()) as to_thread:
@@ -912,6 +1146,97 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         # dispatch is handed to to_thread(), which is called synchronously to build the
         # awaitable — so its arguments are visible without waiting for the task to run.
         return action, reselect, to_thread
+
+    async def test_missing_tunnel_evidence_never_switches_or_cleans_sessions(self):
+        for attempt in range(main.failover.FAILURES_BEFORE_REPORT):
+            action, reselect, _ = self._judge(None, 0)
+            self.assertIn(action, (main.failover.HOLD, main.failover.REPORT))
+            reselect.assert_not_called()
+        self.stalled.assert_not_called()
+        self.assertEqual(main.hub.exit_ledgers["9"]["strikes"], 0)
+
+    async def test_retransmit_read_failure_preserves_connected_evidence(self):
+        for attempt in range(3):
+            action, reselect, _ = self._judge("CONNECTED", 0, evidence_error=OSError("unreadable"))
+            self.assertEqual(action, main.failover.HOLD)
+            reselect.assert_not_called()
+        self.stalled.assert_not_called()
+        self.assertEqual(main.hub.exit_ledgers["9"]["strikes"], 0)
+
+    async def test_dns_failure_never_strikes_or_cleans_an_exit(self):
+        for attempt in range(3):
+            action, reselect, _ = self._judge("DOWN", 10, reason="epdg_unresolved")
+            self.assertEqual(action, main.failover.HOLD)
+            reselect.assert_not_called()
+        self.stalled.assert_not_called()
+
+    async def test_direct_missing_and_nonselectable_exits_do_not_accumulate_ledgers(self):
+        for exits in ({}, {"exits": {}}, {"exits": {"us": {"mode": "direct"}}},
+                      {"exits": {"us": {"mode": "manual", "node": "fixed"}}}):
+            main.hub.exit_ledgers["9"] = {"exhausted": True, "given_up": True}
+            for attempt in range(4):
+                action, reselect, notify = self._judge("DOWN", 0, exits=exits)
+                self.assertEqual(action, main.failover.HOLD)
+                reselect.assert_not_called()
+                notify.assert_not_called()
+                self.assertNotIn("9", main.hub.exit_ledgers)
+        self.stalled.assert_not_called()
+
+    async def test_disabled_proxy_ignores_stale_subscription_status(self):
+        with patch.object(main.cfg, "get_settings", return_value={"proxy": {"enabled": False}}):
+            action, reselect, _ = self._judge("DOWN", 0)
+        self.assertEqual(action, main.failover.HOLD)
+        self.assertNotIn("9", main.hub.exit_ledgers)
+        reselect.assert_not_called()
+        self.stalled.assert_not_called()
+
+    async def test_a_momentarily_unknown_subscription_node_keeps_the_walk(self):
+        # The host blanks the node on every status cycle until the Clash API answers, so a
+        # freeze can land on a cycle where the exit is known to be a subscription pool but
+        # its current member is not. That is no evidence: a backed-off or given-up walk must
+        # survive it unchanged, or the line re-walks the pool and notifies all over again.
+        ledger = {**main.failover.blank_ledger(), "node": "node-b", "strikes": 1,
+                  "tried": ["node-a", "node-b"], "exhausted": True, "given_up": True,
+                  "failures": 7, "reported": True}
+        main.hub.exit_ledgers["9"] = dict(ledger)
+        unknown = {"exits": {"us": {"node": "", "candidates": ["node-a", "node-b"],
+                                    "selection": "auto", "mode": "subscription"}}}
+        action, reselect, notify = self._judge("DOWN", 0, exits=unknown)
+        self.assertEqual(action, main.failover.HOLD)
+        self.assertEqual(main.hub.exit_ledgers["9"], ledger)
+        reselect.assert_not_called()
+        notify.assert_not_called()
+        self.stalled.assert_not_called()
+
+    async def test_direct_freezes_keep_normal_retry_cadence(self):
+        st = {"state": "TUNNEL_DOWN", "reason_code": "tunnel_network", "reason": "x"}
+        with patch.object(main.egress, "status", return_value={"exits": {"us": {"mode": "direct"}}}), \
+                patch.object(main, "_local_card_fault", return_value=""), \
+                patch.object(main, "_save_exit_ledgers"), \
+                patch.object(main.asyncio, "to_thread", new=AsyncMock()), \
+                patch.object(main.hub, "drop_ami", new=AsyncMock()):
+            for attempt in range(4):
+                main.hub.reset_health("9")
+                health = main.hub.health_for("9")
+                health["fail_start"] = main.time.monotonic() - 10000
+                before = main.time.monotonic()
+                main.apply_health("9", self.INST, dict(st))
+                self.assertGreaterEqual(health["next_retry_at"], before + 160)
+                self.assertLess(health["next_retry_at"], before + 170)
+                self.assertNotIn("9", main.hub.exit_ledgers)
+
+    def test_empty_or_missing_ike_logs_are_explicitly_unavailable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.assertFalse(main.engine._charon_evidence(temp)["available"])
+            run = Path(temp) / "run"
+            run.mkdir()
+            log = run / "charon.log"
+            log.write_text("")
+            self.assertFalse(main.engine._charon_evidence(temp)["available"])
+            log.write_text("tunnel CONNECTED\n")
+            evidence = main.engine._charon_evidence(temp)
+            self.assertTrue(evidence["available"])
+            self.assertEqual(evidence["retransmits"], 0)
 
     async def test_a_healthy_tunnel_neither_moves_the_exit_nor_notifies(self):
         action, reselect, to_thread = self._judge("CONNECTED", 0)
@@ -932,7 +1257,7 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         seen = []
         for node in ("node-a", "node-b"):
             exits = {"exits": {"us": {"node": node, "candidates": ["node-a", "node-b"],
-                                      "selection": "auto"}}}
+                                      "selection": "auto", "mode": "subscription"}}}
             for _ in range(main.failover.STRIKES_PER_NODE):
                 action, _reselect, to_thread = self._judge("DOWN", 0, exits)
                 seen.append((action, to_thread))

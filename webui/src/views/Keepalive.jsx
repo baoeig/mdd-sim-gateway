@@ -9,6 +9,7 @@ import AllowancePanel from './AllowancePanel.jsx'
 // lives on the device page and is deliberately not repeated here.
 
 const DAY = 86400
+const KEEPALIVE_MAX_INTERVAL_DAYS = 365
 
 const fmtDate = (ts) => (ts ? new Date(ts * 1000).toLocaleDateString() : '—')
 const fmtDateTime = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : '—')
@@ -95,7 +96,7 @@ function KeepaliveForm({ line, onSaved, showToast }) {
     <div className="u-form-grid" style={{ marginTop: 10 }}>
       <div>
         <label>{t('Then every (days)')}</label>
-        <input type="number" min="1" max="90" value={draft.interval_days}
+        <input type="number" min="1" max={KEEPALIVE_MAX_INTERVAL_DAYS} value={draft.interval_days}
           onChange={e => set({ interval_days: Number(e.target.value) })} />
       </div>
       <div />
@@ -219,15 +220,16 @@ function AbsentLines({ lines, onChanged, showToast }) {
 export default function Keepalive({ showToast }) {
   const { t } = useI18n()
   const [rows, setRows] = useState(null)
+  const [loadError, setLoadError] = useState(false)
   const [open, setOpen] = useState(null)
 
   const load = useCallback(async () => {
-    try { setRows((await api.keepaliveSummary()).lines || []) }
-    catch (error) { showToast?.(error.message); setRows([]) }
+    try { setRows((await api.keepaliveSummary()).lines || []); setLoadError(false) }
+    catch (error) { showToast?.(error.message); setLoadError(true) }
   }, [showToast])
   useEffect(() => { load(); const id = setInterval(load, 30000); return () => clearInterval(id) }, [load])
 
-  if (rows === null) return <p>{t('Loading')}…</p>
+  if (rows === null) return <p className={loadError ? 'u-error' : ''}>{t(loadError ? 'Loading failed' : 'Loading')} {!loadError && '…'}</p>
   if (!rows.length) return <div className="u-empty"><div className="u-empty-icon">◷</div>
     <h3>{t('No lines yet')}</h3><p>{t('Add a SIM line first; its balance and number keeping show up here.')}</p></div>
 

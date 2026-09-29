@@ -14,6 +14,7 @@ Never fails the caller (all exceptions swallowed).
 import os
 import sys
 import json
+import time
 
 
 def load_env():
@@ -38,7 +39,7 @@ def main():
     env = load_env()
     manager_url = os.environ.get("MANAGER_URL") or env.get("MANAGER_URL", "")
     inst_id = os.environ.get("MDD_ID") or env.get("MDD_ID", "1")
-    payload = {"instance": inst_id, "event": event, "args": args}
+    payload = {"ts": int(time.time()), "instance": inst_id, "event": event, "args": args}
     # Always append to a local event log so nothing is lost if the manager is down.
     try:
         os.makedirs("/logs", exist_ok=True)
@@ -53,8 +54,20 @@ def main():
         import urllib3
         urllib3.disable_warnings()
         token = os.environ.get("MANAGER_EVENT_TOKEN") or env.get("MANAGER_EVENT_TOKEN", "")
-        requests.post(f"{manager_url.rstrip('/')}/api/engine/event",
-                      json=payload, headers={"X-MDD-Engine-Token": token}, timeout=3, verify=False)
+        r = requests.post(f"{manager_url.rstrip('/')}/api/engine/event",
+                          json=payload, headers={"X-MDD-Engine-Token": token}, timeout=3, verify=False)
+        if r.status_code >= 300:
+            _warn(f"{event} -> {manager_url}: HTTP {r.status_code}")
+    except Exception as e:
+        # Still never fail the caller, but leave a trace in the container log: an unreachable
+        # manager used to drop every inbound SMS without a single line anywhere.
+        _warn(f"{event} -> {manager_url}: {type(e).__name__}")
+
+
+def _warn(msg: str):
+    try:
+        print(f"[notify] event not delivered: {msg} (kept in /logs/events.jsonl)",
+              file=sys.stderr, flush=True)
     except Exception:
         pass
 

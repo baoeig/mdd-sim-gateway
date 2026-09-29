@@ -1,15 +1,18 @@
 import base64
 import json
+import os
 import time
 import io
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from control.app import egress
-from host.mdd_orchestrator import (Orchestrator, clash_outbound, parse_manual_outbound,
-                                   parse_proxy_url, parse_share_link, xray_xhttp_outbound)
+from host.mdd_orchestrator import (Orchestrator, clash_outbound, node_needs_xray,
+                                   parse_manual_outbound, parse_proxy_url, parse_share_link,
+                                   xray_outbound)
 
 
 class CountryEgressTests(unittest.TestCase):
@@ -141,13 +144,43 @@ class PastedNodeTests(unittest.TestCase):
             "vless://uuid-2@xhttp.example.net:443?security=reality&type=xhttp"
             "&sni=www.microsoft.com&fp=chrome&pbk=public-key&sid=0123"
             "&host=cdn.example.net&path=%2Fupdates&mode=packet-up&packetEncoding=xudp")
-        outbound = xray_xhttp_outbound(node, "out-one")
+        outbound = xray_outbound(node, "out-one")
         stream = outbound["streamSettings"]
         self.assertEqual(stream["network"], "xhttp")
         self.assertEqual(stream["realitySettings"]["publicKey"], "public-key")
         self.assertEqual(stream["xhttpSettings"]["path"], "/updates")
         self.assertEqual(outbound["settings"]["vnext"][0]["users"][0]["packetEncoding"],
                          "xudp")
+
+    def _packet_encoding(self, node):
+        return xray_outbound(node, "out-one")["settings"]["vnext"][0]["users"][0][
+            "packetEncoding"]
+
+    def test_a_node_that_declares_a_packet_encoding_keeps_it(self):
+        """packetEncoding decides how UDP rides the VLESS connection, so the node decides.
+
+        The tunnel these exits carry is IKEv2/ESP on UDP 500 and 4500. A server that speaks
+        packetaddr and is handed xudp does not fail loudly — UDP simply stops arriving, the
+        tunnel never comes up, and the failover logic goes looking for a reason on the SIM
+        side. Defaulting to xudp is right; overwriting a declared value with it is not, and
+        nothing else in the suite would notice if the default were hardcoded.
+        """
+        node = parse_share_link(
+            "vless://uuid-3@r.example.net:443?security=reality&type=tcp"
+            "&sni=www.microsoft.com&fp=chrome&pbk=public-key&sid=0123")
+        node["packet-encoding"] = "packetaddr"
+        self.assertEqual(self._packet_encoding(node), "packetaddr")
+
+    def test_a_node_with_no_packet_encoding_falls_back_to_xudp(self):
+        # Both the parser (no packetEncoding in the link) and the builder (an empty value on
+        # the node) have to land on the same default, or a link and a hand-edited profile
+        # would behave differently for the same node.
+        node = parse_share_link(
+            "vless://uuid-4@r.example.net:443?security=reality&type=tcp"
+            "&sni=www.microsoft.com&fp=chrome&pbk=public-key&sid=0123")
+        self.assertEqual(self._packet_encoding(node), "xudp")
+        node["packet-encoding"] = ""
+        self.assertEqual(self._packet_encoding(node), "xudp")
 
     def test_xhttp_profile_is_bridged_through_loopback_socks(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -665,6 +698,98 @@ class ManagedReselectTests(unittest.TestCase):
                 app.process_reselect_requests(states)
             self.assertEqual(app.selected, [])      # nothing measured, nothing moved
 
+    def test_persisting_a_selected_default_does_not_restart_any_country(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = self._orchestrator(temp, {})
+            config, _states = _build(app, {})
+            app.apply_singbox(config)
+            running = Mock()
+            running.poll.return_value = None
+            app.singbox = running
+            app.dry_run = False
+            started_at = app.singbox_started_at
+            app.exit_unranked.clear()
+            app.last_exit_node["us"] = "US Bravo"
+            updated, _states = _build(app, {})
+            with patch("host.mdd_orchestrator.subprocess.Popen") as spawn:
+                app.apply_singbox(updated)
+                app.apply_singbox(updated)
+            spawn.assert_not_called()
+            running.terminate.assert_not_called()
+            self.assertEqual(app.singbox_started_at, started_at)
+            self.assertEqual(app.exit_unranked, set())
+            self.assertEqual(json.loads(app.generated.read_text()), updated)
+            self.assertEqual(app.last_proxy_config, updated)
+
+    def test_real_config_changes_and_new_locks_still_restart(self):
+        for change in ("outbound", "lock", "dead_process"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temp:
+                app = self._orchestrator(temp, {})
+                app.last_exit_node["us"] = "US Bravo"
+                config, _states = _build(app, {})
+                app.apply_singbox(config)
+                old = Mock()
+                old.poll.return_value = 1 if change == "dead_process" else None
+                app.singbox = old
+                app.dry_run = False
+                updated, _states = _build(app, {"pinned_node": "US Alpha"}
+                                          if change == "lock" else {})
+                if change == "outbound":
+                    member = next(outbound for outbound in updated["outbounds"]
+                                  if outbound.get("tag") == "exit-us-0")
+                    member["server_port"] += 1
+                replacement = Mock()
+                replacement.poll.return_value = None
+                with patch("host.mdd_orchestrator.shutil.which", return_value="sing-box"), \
+                        patch("host.mdd_orchestrator.run", return_value=SimpleNamespace(returncode=0)), \
+                        patch("host.mdd_orchestrator.time.sleep"), \
+                        patch("host.mdd_orchestrator.subprocess.Popen", return_value=replacement) as spawn:
+                    app.apply_singbox(updated)
+                spawn.assert_called_once()
+                self.assertIs(app.singbox, replacement)
+                self.assertEqual(app.last_proxy_config, updated)
+
+    def test_the_exit_tun_is_taken_back_out_of_the_host_dns(self):
+        """sing-tun registers every tun with systemd-resolved as the resolver for "~.",
+        which took all DNS away from an Ubuntu host as soon as an exit was enabled."""
+        with tempfile.TemporaryDirectory() as temp:
+            app = self._orchestrator(temp, {})
+            config, _states = _build(app, {})
+            app.dry_run = False
+            process = Mock()
+            process.poll.return_value = None
+            registered = {"done": False}
+            calls = []
+
+            def fake_run(args, **kwargs):
+                calls.append(args)
+                shown = "Link 22 (mdd-us): ~." if registered["done"] else "Link 22 (mdd-us):"
+                return SimpleNamespace(returncode=0, stdout=shown, stderr="")
+
+            with patch("host.mdd_orchestrator.shutil.which",
+                       side_effect=lambda name: f"/usr/bin/{name}"), \
+                    patch("host.mdd_orchestrator.run", side_effect=fake_run), \
+                    patch("host.mdd_orchestrator.time.sleep"), \
+                    patch("host.mdd_orchestrator.subprocess.Popen", return_value=process):
+                app.apply_singbox(config)
+                self.assertEqual(app.tun_dns_pending, {"mdd-us"})
+                # The registration is asynchronous: not there yet, so nothing is reverted.
+                app.release_tun_dns()
+                self.assertNotIn(["/usr/bin/resolvectl", "revert", "mdd-us"], calls)
+                self.assertEqual(app.tun_dns_pending, {"mdd-us"})
+                registered["done"] = True
+                app.release_tun_dns()
+                self.assertIn(["/usr/bin/resolvectl", "revert", "mdd-us"], calls)
+                self.assertEqual(app.tun_dns_pending, set())
+
+            # A host without systemd-resolved never got the registration; nothing is run.
+            app.tun_dns_pending = {"mdd-us"}
+            with patch("host.mdd_orchestrator.shutil.which", return_value=None), \
+                    patch("host.mdd_orchestrator.run") as run:
+                app.release_tun_dns()
+            run.assert_not_called()
+            self.assertEqual(app.tun_dns_pending, set())
+
     def test_a_node_that_did_not_survive_the_rewrite_starts_over(self):
         with tempfile.TemporaryDirectory() as temp:
             app = self._orchestrator(temp, {"exit-us-0": 300, "exit-us-1": 800})
@@ -833,7 +958,7 @@ class IdleBackoffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             app = self._app(temp)
             # None of them exist yet on a fresh install.
-            self.assertEqual(len(app._input_mtimes()), 7)
+            self.assertEqual(len(app._input_mtimes()), 8)
 
 
 class HotplugResponsivenessTests(unittest.TestCase):
@@ -853,4 +978,322 @@ class HotplugResponsivenessTests(unittest.TestCase):
             self.assertNotEqual(two_devices, three_devices,
                                 "a newly plugged modem must end the backoff")
             # A platform without a USB tree still returns a stable shape.
-            self.assertEqual(len(app._input_mtimes()), 7)
+            self.assertEqual(len(app._input_mtimes()), 8)
+
+
+class PastedNodeFidelityTests(unittest.TestCase):
+    """A link this gateway reads differently from every other client is a silent outage.
+
+    Issue #27: nodes that v2rayN connected to failed here with a generic message, because
+    the parameters that make them work were dropped on the way in.
+    """
+
+    def test_hysteria2_link_keeps_its_obfuscation(self):
+        node = parse_share_link(
+            "hysteria2://letmein@hk.example.net:8443/?obfs=salamander"
+            "&obfs-password=obfs-pw&sni=hk.example.net#HK")
+        outbound = clash_outbound(node, "exit-hk")
+        # Without this the server discards every packet and the node looks simply dead.
+        self.assertEqual(outbound["obfs"], {"type": "salamander", "password": "obfs-pw"})
+
+    def test_hysteria2_link_keeps_a_colon_inside_its_auth_string(self):
+        node = parse_share_link("hysteria2://user:secret@hk.example.net:8443#HK")
+        self.assertEqual(node["password"], "user:secret")
+
+    def test_alpn_is_read_for_protocols_other_than_vless(self):
+        node = parse_share_link("hysteria2://pw@hk.example.net:8443/?alpn=h3&sni=hk.example.net")
+        self.assertEqual(clash_outbound(node, "exit-hk")["tls"]["alpn"], ["h3"])
+
+    def test_an_unsupported_transport_is_refused_instead_of_silently_downgraded(self):
+        # It used to yield a plain-TCP outbound that passed every check and never connected.
+        for link in (
+            "vless://uuid-1@h.example.net:443?security=tls&type=grpc&serviceName=g",
+            "vless://uuid-1@h.example.net:443?security=tls&type=httpupgrade&path=%2Fu",
+        ):
+            with self.assertRaises(ValueError) as caught:
+                parse_share_link(link)
+            self.assertIn("not supported", str(caught.exception))
+
+    def test_supported_transports_still_parse(self):
+        self.assertEqual(parse_share_link(
+            "vless://uuid-1@h.example.net:443?security=tls&type=ws&path=%2Fws")["network"], "ws")
+        self.assertEqual(parse_share_link(
+            "trojan://pw@h.example.net:443?sni=h.example.net")["network"], "tcp")
+
+
+class ProxyProfileDescriptionTests(unittest.TestCase):
+    """The parsed view is what answers "it works in my other client"."""
+
+    def test_it_reports_the_switches_that_decide_whether_a_node_carries_ike(self):
+        parsed = egress.describe_proxy_profile({
+            "type": "node",
+            "value": "hysteria2://pw@hk.example.net:8443/?obfs=salamander"
+                     "&obfs-password=o&sni=hk.example.net&insecure=1"})
+        self.assertEqual(parsed["protocol"], "hysteria2")
+        self.assertEqual(parsed["obfs"], "salamander")
+        self.assertTrue(parsed["obfs_password_set"])
+        self.assertTrue(parsed["udp_capable"])
+        self.assertEqual(parsed["sni"], "hk.example.net")
+
+    def test_it_never_carries_a_secret_or_an_address(self):
+        parsed = egress.describe_proxy_profile({
+            "type": "node",
+            "value": "vless://uuid-secret@hk.example.net:443?security=reality"
+                     "&type=tcp&sni=www.microsoft.com&pbk=public-key&sid=abcd"})
+        blob = json.dumps(parsed)
+        for secret in ("uuid-secret", "hk.example.net", "public-key", "abcd", "443"):
+            self.assertNotIn(secret, blob)
+        self.assertTrue(parsed["reality"])
+
+    def test_a_link_it_cannot_read_reports_the_reason(self):
+        parsed = egress.describe_proxy_profile({
+            "type": "node",
+            "value": "vless://uuid-1@h.example.net:443?security=tls&type=grpc"})
+        self.assertIn("not supported", parsed["error"])
+
+
+class ExitReadinessHonestyTests(unittest.TestCase):
+    def test_a_singbox_that_refused_to_start_leaves_no_exit_marked_ready(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=True)
+            desired = {"proxy": {"enabled": True,
+                                 "profiles": {"n": {"name": "HK", "type": "node",
+                                                    "value": "trojan://pw@hk.example.net:443"}},
+                                 "exits": {"hk": {"enabled": True, "profile_id": "n"}}},
+                       "lines": [{"id": "1", "country": "hk", "epdg": "e.example.net"}]}
+            with patch.object(Orchestrator, "apply_singbox",
+                              side_effect=RuntimeError("sing-box exited during startup")):
+                app.reconcile_proxy(desired)
+            published = json.loads((app.root / "proxy-status.json").read_text())
+        exit_state = published["exits"]["hk"]
+        # Publishing ready here sent the UDP test at a socket nobody was serving.
+        self.assertFalse(exit_state["ready"])
+        self.assertIn("sing-box exited", exit_state["error"])
+
+
+class RealityRunsOnXrayTests(unittest.TestCase):
+    """REALITY is an Xray protocol, so Xray is what must speak it.
+
+    Issue #27: a server on a newer Xray build answered Xray clients and failed sing-box with
+    "reality verification failed". Routing REALITY through the Xray already installed for
+    XHTTP removes that version skew instead of chasing it.
+    """
+
+    REALITY_LINK = ("vless://uuid-1@r.example.net:443?security=reality&type=tcp"
+                    "&sni=www.microsoft.com&fp=chrome&pbk=public-key&sid=abcd"
+                    "&spx=%2F&flow=xtls-rprx-vision")
+
+    def test_reality_and_xhttp_pick_xray_while_plain_tls_stays_on_singbox(self):
+        self.assertTrue(node_needs_xray(parse_share_link(self.REALITY_LINK)))
+        self.assertTrue(node_needs_xray(parse_share_link(
+            "vless://uuid-2@x.example.net:443?security=reality&type=xhttp"
+            "&sni=www.microsoft.com&pbk=public-key&sid=abcd")))
+        # A node sing-box handles correctly must not be moved off it.
+        self.assertFalse(node_needs_xray(parse_share_link(
+            "vless://uuid-3@t.example.net:443?security=tls&type=ws&path=%2Fws")))
+        self.assertFalse(node_needs_xray(parse_share_link(
+            "trojan://pw@t.example.net:443?sni=t.example.net")))
+
+    def test_vision_reality_over_raw_tcp_converts_for_xray(self):
+        outbound = xray_outbound(parse_share_link(self.REALITY_LINK), "out-one")
+        stream = outbound["streamSettings"]
+        # Xray calls the plain TCP transport "raw".
+        self.assertEqual(stream["network"], "raw")
+        self.assertEqual(stream["security"], "reality")
+        self.assertEqual(stream["realitySettings"]["publicKey"], "public-key")
+        self.assertEqual(stream["realitySettings"]["shortId"], "abcd")
+        self.assertEqual(stream["realitySettings"]["serverName"], "www.microsoft.com")
+        self.assertEqual(stream["realitySettings"]["spiderX"], "/")
+        self.assertEqual(outbound["settings"]["vnext"][0]["users"][0]["flow"],
+                         "xtls-rprx-vision")
+
+    def test_a_reality_exit_is_built_as_a_loopback_bridge_to_xray(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=True)
+            config, states = app.build_proxy_config({
+                "profiles": {"node-one": {"name": "UK Reality", "type": "node",
+                                          "value": self.REALITY_LINK}},
+                "exits": {"gb": {"enabled": True, "profile_id": "node-one"}},
+            })
+        self.assertTrue(states["gb"]["ready"])
+        exit_outbound = next(x for x in config["outbounds"] if x.get("tag") == "exit-gb")
+        # sing-box only carries it to the local Xray; the node itself is Xray's business.
+        self.assertEqual(exit_outbound["type"], "socks")
+        self.assertEqual(exit_outbound["server"], "127.0.0.1")
+        self.assertTrue(app.next_xray_config)
+        xray_out = app.next_xray_config["outbounds"][0]
+        self.assertEqual(xray_out["protocol"], "vless")
+        self.assertEqual(xray_out["streamSettings"]["security"], "reality")
+
+    def test_the_node_test_reports_which_engine_carries_it(self):
+        parsed = egress.describe_proxy_profile({"type": "node", "value": self.REALITY_LINK})
+        self.assertEqual(parsed["engine"], "xray")
+        self.assertTrue(parsed["reality"])
+        self.assertEqual(egress.describe_proxy_profile(
+            {"type": "node", "value": "trojan://pw@t.example.net:443"})["engine"], "sing-box")
+
+
+class UdpProbeTargetTests(unittest.TestCase):
+    """One hard-coded resolver made the probe a test of that address, not of UDP."""
+
+    def test_defaults_are_three_distinct_public_resolvers(self):
+        self.assertEqual(egress.udp_probe_targets(), ["1.1.1.1", "8.8.8.8", "9.9.9.9"])
+
+    def test_the_list_is_configurable_and_rejects_junk(self):
+        with patch.dict(os.environ, {"MDD_UDP_PROBE_TARGETS": "8.8.4.4, not-an-ip ,8.8.4.4,9.9.9.9"}):
+            self.assertEqual(egress.udp_probe_targets(), ["8.8.4.4", "9.9.9.9"])
+        with patch.dict(os.environ, {"MDD_UDP_PROBE_TARGETS": "garbage"}):
+            self.assertEqual(egress.udp_probe_targets(), ["1.1.1.1"])
+
+    def test_a_blackholed_first_resolver_falls_back_instead_of_failing(self):
+        calls = []
+
+        def probe(host, port, target, timeout, username="", password=""):
+            calls.append(target)
+            if target != ("dns", "9.9.9.9", 53):
+                raise egress.EgressError("timed out")
+            return 42
+
+        with patch.object(egress, "_udp_probe_once", side_effect=probe):
+            self.assertEqual(egress.test_udp_proxy("127.0.0.1", 1080), 42)
+        self.assertEqual(calls[0], ("dns", "1.1.1.1", 53))
+        self.assertEqual(calls[-1], ("dns", "9.9.9.9", 53))
+
+    def test_epdg_resolution_uses_the_selected_socks_udp_path(self):
+        with patch.object(egress, "_udp_probe_once", return_value="198.51.100.25") as probe:
+            address = egress.resolve_ipv4_via_socks(
+                "socks5://mdd-egress:22157", "epdg.example.net")
+        self.assertEqual(address, "198.51.100.25")
+        self.assertEqual(probe.call_args.args[2],
+                         ("resolve", "1.1.1.1", 53, "epdg.example.net"))
+
+    def test_every_probe_failing_names_each_one(self):
+        with patch.object(egress, "_udp_probe_once",
+                          side_effect=egress.EgressError("timed out")):
+            with self.assertRaises(egress.EgressError) as caught:
+                egress.test_udp_proxy("127.0.0.1", 1080)
+        message = str(caught.exception)
+        for name in ("1.1.1.1", "8.8.8.8", "9.9.9.9",
+                     "stun.cloudflare.com", "stun.l.google.com"):
+            self.assertIn(name, message)
+
+    def test_stun_carries_the_verdict_when_port_53_is_intercepted(self):
+        """The reported case: DNS is rewritten end to end, the exit itself carries UDP.
+
+        VoWiFi runs IKE on UDP 500/4500 and never queries these resolvers, so a panel or
+        provider rewriting port 53 must not be able to condemn the exit.
+        """
+        def probe(host, port, target, timeout, username="", password=""):
+            if target[0] == "dns":
+                raise egress.EgressError("timed out")
+            return 17
+
+        with patch.object(egress, "_udp_probe_once", side_effect=probe):
+            self.assertEqual(egress.test_udp_proxy("127.0.0.1", 1080), 17)
+
+    def test_the_plan_interleaves_so_neither_family_decides_alone(self):
+        kinds = [probe[0] for probe in egress.udp_probe_plan()]
+        self.assertEqual(kinds[:4], ["dns", "stun", "dns", "stun"])
+        # A blocked resolver must not push every STUN probe past the time budget.
+        self.assertIn("stun", kinds[:2])
+
+    def test_stun_targets_are_configurable_and_reject_junk(self):
+        with patch.dict(os.environ, {"MDD_UDP_STUN_TARGETS":
+                                     "a.example:3478, nonsense ,b.example:0,c.example:19302"}):
+            self.assertEqual(egress.stun_probe_targets(),
+                             [("a.example", 3478), ("c.example", 19302)])
+
+
+class VlessEncryptionTests(unittest.TestCase):
+    """Xray 26.7+ VLESS Encryption: the client must echo the server's declared value.
+
+    Issue #27's actual cause. The parameter was dropped and "none" hard-coded, so the
+    client connected, could not be understood, and every probe timed out with the server
+    logging nothing — indistinguishable from a dead node.
+    """
+
+    ENC = "mlkem768x25519plus.native.0rtt.6wD_327L54KNiTgD9LOucKtF6abQ3_-U9qWY7mXTjlk"
+
+    def link(self, encryption=None):
+        extra = f"&encryption={encryption}" if encryption is not None else ""
+        return ("vless://uuid-1@r.example.net:443?security=reality&type=tcp"
+                "&sni=www.apple.com&pbk=public-key&sid=abcd&flow=xtls-rprx-vision" + extra)
+
+    def test_the_encryption_value_reaches_the_xray_outbound(self):
+        node = parse_share_link(self.link(self.ENC))
+        self.assertEqual(node["encryption"], self.ENC)
+        user = xray_outbound(node, "out")["settings"]["vnext"][0]["users"][0]
+        self.assertEqual(user["encryption"], self.ENC)
+
+    def test_an_encrypted_node_is_routed_to_xray(self):
+        # Even without REALITY: only Xray implements this.
+        plain = ("vless://uuid-1@r.example.net:443?security=tls&type=tcp"
+                 f"&sni=x.example.net&encryption={self.ENC}")
+        self.assertTrue(node_needs_xray(parse_share_link(plain)))
+
+    def test_sing_box_refuses_it_by_name_instead_of_timing_out(self):
+        node = parse_share_link(self.link(self.ENC))
+        with self.assertRaises(ValueError) as caught:
+            clash_outbound(node, "exit-gb")
+        self.assertIn("VLESS Encryption", str(caught.exception))
+
+    def test_ordinary_nodes_still_say_none(self):
+        for link in (self.link(), self.link("none")):
+            node = parse_share_link(link)
+            self.assertEqual(node["encryption"], "none")
+            user = xray_outbound(node, "out")["settings"]["vnext"][0]["users"][0]
+            self.assertEqual(user["encryption"], "none")
+            # And they remain describable through the sing-box converter.
+            self.assertEqual(clash_outbound(node, "exit-gb")["type"], "vless")
+
+    def test_the_summary_names_the_family_without_the_key_material(self):
+        parsed = egress.describe_proxy_profile({"type": "node", "value": self.link(self.ENC)})
+        self.assertEqual(parsed["encryption"], "mlkem768x25519plus")
+        self.assertNotIn(self.ENC, json.dumps(parsed))
+        self.assertEqual(parsed["engine"], "xray")
+
+
+class TestProxyDiagnosticsTests(unittest.TestCase):
+    def test_both_engine_streams_are_quoted(self):
+        """Xray logs to stdout and sing-box to stderr; reading one left the other silent."""
+        process = SimpleNamespace(
+            stdout=io.StringIO("xray: proxy/vless/outbound: connection ends\n"),
+            stderr=io.StringIO("sing-box: outbound/socks: timeout\n"))
+        detail = egress._process_detail(process)
+        self.assertIn("xray", detail)
+        self.assertIn("sing-box", detail)
+
+    def test_a_process_without_pipes_is_not_an_error(self):
+        self.assertEqual(egress._process_detail(None), "")
+        self.assertEqual(
+            egress._process_detail(SimpleNamespace(stdout=None, stderr=None)), "")
+
+
+class XrayFailureBlastRadiusTests(unittest.TestCase):
+    """REALITY made Xray load-bearing; its failure must not take unrelated exits down."""
+
+    REALITY = ("vless://uuid-1@r.example.net:443?security=reality&type=tcp"
+               "&sni=www.apple.com&pbk=public-key&sid=abcd&flow=xtls-rprx-vision")
+    PLAIN = "trojan://pw@t.example.net:443?sni=t.example.net"
+
+    def _reconcile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            app = Orchestrator(Path(temp), Path.cwd(), dry_run=True)
+            desired = {"proxy": {"enabled": True, "profiles": {
+                            "r": {"name": "R", "type": "node", "value": self.REALITY},
+                            "p": {"name": "P", "type": "node", "value": self.PLAIN}},
+                        "exits": {"gb": {"enabled": True, "profile_id": "r"},
+                                  "us": {"enabled": True, "profile_id": "p"}}},
+                       "lines": []}
+            with patch.object(Orchestrator, "apply_xray",
+                              side_effect=RuntimeError("Xray-core executable not found")), \
+                    patch.object(Orchestrator, "apply_routes"):
+                app.reconcile_proxy(desired)
+            return json.loads((app.root / "proxy-status.json").read_text())
+
+    def test_only_the_xray_backed_country_fails(self):
+        exits = self._reconcile()["exits"]
+        self.assertFalse(exits["gb"]["ready"])
+        self.assertIn("Xray is unavailable", exits["gb"]["error"])
+        # The trojan exit never touches Xray and must still be routed.
+        self.assertTrue(exits["us"]["ready"], "an unrelated exit was taken down with Xray")

@@ -8,8 +8,10 @@ from __future__ import annotations
 import io
 import json
 import os
+from collections import deque
 from pathlib import Path
 import re
+import shutil
 import tarfile
 import time
 import zipfile
@@ -18,6 +20,7 @@ import docker
 import yaml
 
 from . import config as cfg
+from . import store
 
 
 _SECRET_KEYS = re.compile(
@@ -26,6 +29,7 @@ _SECRET_KEYS = re.compile(
     r"activation|matching_id|confirmation|smdp",
     re.I,
 )
+_SAFE_DIAGNOSTIC_KEYS = {"imei_valid", "iccid_valid", "imei_source_matches"}
 _LONG_DIGITS = re.compile(r"(?<!\d)\+?\d{10,40}(?!\d)")
 _URL = re.compile(r"\b(?:https?|socks5h?)://[^\s\"'<>]+", re.I)
 _ACTIVATION_CODE = re.compile(r"\bLPA:1\$[^\s\"'<>]+", re.I)
@@ -41,13 +45,42 @@ _MULTILINE_SECRET = re.compile(
 )
 
 
-def redact(value, key: str = ""):
-    if _SECRET_KEYS.search(key):
+def _path_secret(path: tuple[str, ...]) -> bool:
+    """Fields whose generic names become private only in a specific document context."""
+    if not path:
+        return False
+    key = path[-1]
+    if _SECRET_KEYS.search(key) or key in {"profile_id", "proxy_profile_id"}:
+        return True
+    if "egress" in path and key in {"node", "pinned_node", "candidates"}:
+        return True
+    if "network" in path and "addresses" in path and key == "address":
+        return True
+    if len(path) >= 3 and path[0:2] == ("proxy", "profiles") \
+            and key in {"name", "value", "server", "username", "outbound_tag"}:
+        return True
+    if "feishu" in path and "channels" in path and key in {"name", "url", "secret"}:
+        return True
+    return False
+
+
+def redact(value, key: str = "", path: tuple[str, ...] = ()):
+    current = path + ((key,) if key else ())
+    # These closed-schema booleans describe whether evidence exists without carrying the
+    # identity itself. A malformed/non-boolean value remains secret by key name.
+    if current and current[-1] in _SAFE_DIAGNOSTIC_KEYS and isinstance(value, bool):
+        return value
+    if _path_secret(current):
         return "<redacted>" if value not in (None, "", [], {}) else value
     if isinstance(value, dict):
-        return {str(k): redact(v, str(k)) for k, v in value.items()}
+        # Profile ids are operator-controlled labels and can themselves name a provider or
+        # account. Keep the number and shape of entries without exporting those labels.
+        if current == ("proxy", "profiles"):
+            return {f"profile-{index}": redact(v, path=current + ("[]",))
+                    for index, v in enumerate(value.values(), 1)}
+        return {str(k): redact(v, str(k), current) for k, v in value.items()}
     if isinstance(value, list):
-        return [redact(v, key) for v in value]
+        return [redact(v, path=current + ("[]",)) for v in value]
     if isinstance(value, str):
         value = _ACTIVATION_CODE.sub("<redacted-activation-code>", value)
         value = _URL.sub("<redacted-url>", value)
@@ -84,23 +117,26 @@ def redact_log(text: str) -> str:
     return "\n".join(lines)
 
 
-def _redact_record(value, key: str = ""):
+def _redact_record(value, key: str = "", path: tuple[str, ...] = ()):
     """Redact inside a diagnostic record, blanking only the strings that carry key material.
 
     Same rules as ``redact_log``, applied per string rather than per line. A captured log tail
     is a list of log lines, so each element gets exactly the treatment it would have got in
     its own file, and the registration/SIP/host evidence beside it survives.
     """
-    if _SECRET_KEYS.search(key):
+    current = path + ((key,) if key else ())
+    if current and current[-1] in _SAFE_DIAGNOSTIC_KEYS and isinstance(value, bool):
+        return value
+    if _path_secret(current):
         return "<redacted>" if value not in (None, "", [], {}) else value
     if isinstance(value, dict):
-        return {str(k): _redact_record(v, str(k)) for k, v in value.items()}
+        return {str(k): _redact_record(v, str(k), current) for k, v in value.items()}
     if isinstance(value, list):
-        return [_redact_record(item, key) for item in value]
+        return [_redact_record(item, path=current + ("[]",)) for item in value]
     if isinstance(value, str):
         if _MULTILINE_SECRET.search(value) or _KEY_MATERIAL.search(value):
             return "<redacted cryptographic material>"
-        return redact(value)
+        return redact(value, path=current)
     return value
 
 
@@ -128,6 +164,17 @@ def redact_jsonl(text: str) -> str:
 
 
 CALL_EVENTS = ("call_out", "call_result", "ussd")
+# The dialplan's closed vocabulary for which side ended a call ([hangup-by]).
+HANGUP_BY = ("carrier", "local", "gateway")
+# Asterisk's own log lines at WARNING/ERROR, e.g. "[Sep 21 22:06:43] WARNING[2987][C-00000009]".
+_ASTERISK_PROBLEM = re.compile(r"\b(?:WARNING|ERROR)\[\d+\]")
+_SIP_USERINFO = re.compile(r"\b(sips?|tel):[^\s@;<>\"',]+@", re.I)
+_TEL_URI = re.compile(r"\btel:[^\s;<>\"',]+", re.I)
+CALL_EVENT_SCAN_LINES = 20_000
+SUPPORT_BUNDLE_MAX_BYTES = 10 * 1024 * 1024
+# Leave space for ZIP metadata, the manifest and compression overhead. The final archive is
+# still measured and pruned below; this budget keeps that fallback exceptional.
+SUPPORT_BUNDLE_CONTENT_BYTES = 8 * 1024 * 1024
 
 _MDD_IMAGE_PREFIXES = ("mdd-sim-gateway/", "ghcr.io/mddidd/mdd-sim-gateway-")
 _CURRENT_IMAGE_TAGS = {
@@ -238,30 +285,129 @@ def call_event_evidence(text: str) -> str:
         peer_at = 1 if (event == "call_result" and args and args[0] in ("in", "out")) else 0
         if peer_at < len(args) and not any(ch in args[peer_at] for ch in "*#"):
             args[peer_at] = "<number>"
+        if event == "call_result" and peer_at == 1 and len(args) > 4 \
+                and args[4] not in HANGUP_BY:
+            args[4] = "<unknown>"
         if event == "ussd" and len(args) > 1:
             # That a reply arrived, and how big it was, answers the question. Its text can
             # carry account details and answers nothing.
             args[1] = f"<{len(args[1])} bytes>"
-        out.append(json.dumps({"instance": record.get("instance"), "event": event,
-                               "args": args}, ensure_ascii=False, sort_keys=True))
+        safe = {"instance": record.get("instance"), "event": event, "args": args}
+        if isinstance(record.get("ts"), (int, float)):
+            safe["ts"] = int(record["ts"])
+        out.append(json.dumps(safe, ensure_ascii=False, sort_keys=True))
     return "\n".join(out)
 
 
+def asterisk_problem_lines(text: str) -> str:
+    """Asterisk's WARNING/ERROR lines, with every SIP/tel identity taken out.
+
+    The whole `messages` log cannot ship: its NOTICE lines name the subscriber's IMS public
+    identity on every registration. But an answered call that drops at once leaves its only
+    explanation here — a rejected SDP answer, a failed bridge, a media error — and without it
+    a report reading ANSWER/16 cannot be told apart from the carrier simply hanging up. So keep
+    the problem lines and drop the identity: the user part of any SIP/tel URI is replaced
+    before the generic redactor (long digit runs, hex blobs, key material) runs over the rest.
+    """
+    out = []
+    for line in text.splitlines():
+        if not _ASTERISK_PROBLEM.search(line):
+            continue
+        line = _SIP_USERINFO.sub(lambda m: f"{m.group(1)}:<user>@", line)
+        out.append(_TEL_URI.sub("tel:<number>", line))
+    return redact_log("\n".join(out)) if out else ""
+
+
+def _update_download(relative: Path) -> bool:
+    """A release archive the container updater is downloading into <data>/update.
+
+    The updater takes its backup after downloading, while the four image archives (~500 MB)
+    still sit in its staging directory, so every backup carried them: a Raspberry Pi's SD card
+    lost 500 MB per update until the next update refused for lack of space. They are
+    re-downloadable Release assets, not gateway data.
+    """
+    parts = relative.parts
+    return len(parts) >= 2 and parts[0] == "update" and parts[1].startswith("container-update.")
+
+
 def create_local_backup(system_name: str = "gateway") -> dict:
-    """Create a root-local recovery archive. It is intentionally not returned over HTTP."""
+    """Create a root-local recovery archive. It is intentionally not returned over HTTP.
+
+    The message history goes in as a consistent snapshot rather than the live file, together
+    with every MMS attachment it refers to; the archive is then checked to hold each of those
+    attachments, so restoring it restores whole messages."""
     root = Path(cfg.DATA_DIR).resolve()
     target_dir = root / "backups"
     target_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     target = target_dir / f"{_safe_name(system_name)}-{stamp}.tar.gz"
-    with tarfile.open(target, "w:gz") as archive:
-        for path in sorted(root.rglob("*")):
-            if not path.is_file() or target_dir in path.parents:
-                continue
-            archive.add(path, arcname=str(path.relative_to(root)), recursive=False)
+    history = Path(store.DB_PATH).resolve()
+    snapshot = history.is_relative_to(root) and history.is_file()
+    database_name = str(history.relative_to(root)) if snapshot else ""
+    skipped = {database_name + suffix for suffix in ("", "-journal", "-wal", "-shm")}
+    mms_root = Path(store.mms_dir()).resolve()
+    # Uploads of a message still being composed are working copies, not history.
+    staging_root = (root / "mms-staging").resolve()
+    staging = target_dir / f".staging-{stamp}"
+    for stale in target_dir.glob(".staging-*"):
+        shutil.rmtree(stale, ignore_errors=True)
+    try:
+        referenced = []
+        known_missing = set()
+        if snapshot:
+            snapshot_result = store.snapshot_history(
+                str(staging / database_name), str(staging / "mms"))
+            known_missing = set(snapshot_result.get("missing_parts", []))
+            referenced = _referenced_parts(staging / database_name)
+        with tarfile.open(target, "w:gz") as archive:
+            for path in sorted(root.rglob("*")):
+                if not path.is_file() or target_dir in path.parents \
+                        or staging_root in path.parents:
+                    continue
+                relative = str(path.relative_to(root))
+                if _update_download(path.relative_to(root)):
+                    continue
+                if snapshot and (relative in skipped or mms_root in path.parents):
+                    continue
+                archive.add(path, arcname=relative, recursive=False)
+            if snapshot:
+                archive.add(staging / database_name, arcname=database_name, recursive=False)
+                mms_name = str(mms_root.relative_to(root)) if mms_root.is_relative_to(root) \
+                    else "mms"
+                for path in sorted((staging / "mms").rglob("*")):
+                    if path.is_file():
+                        archive.add(path, recursive=False, arcname=str(
+                            Path(mms_name) / path.relative_to(staging / "mms")))
+        if referenced:
+            with tarfile.open(target, "r:gz") as archive:
+                names = set(archive.getnames())
+            mms_name = str(mms_root.relative_to(root)) if mms_root.is_relative_to(root) \
+                else "mms"
+            absent = [p for p in referenced if f"{mms_name}/{p}" not in names]
+            copy_failures = [part for part in absent if part not in known_missing]
+            if copy_failures:
+                raise RuntimeError(f"the backup is missing {len(copy_failures)} MMS "
+                                   f"attachment(s), e.g. {copy_failures[0]}")
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     os.chmod(target, 0o600)
     return {"ok": True, "name": target.name, "created_at": int(time.time()),
-            "size": target.stat().st_size, "location": "gateway-local"}
+            "size": target.stat().st_size, "location": "gateway-local",
+            "missing_attachments": len(known_missing)}
+
+
+def _referenced_parts(database: Path) -> list[str]:
+    """"<message id>/<file>" of every attachment the history snapshot refers to."""
+    import sqlite3
+    with sqlite3.connect(database) as check:
+        if not check.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                             "AND name='mms_parts'").fetchone():
+            return []
+        rows = check.execute("SELECT message_id, path FROM mms_parts WHERE path!=''").fetchall()
+    return [f"{int(m)}/{p}" for m, p in rows]
 
 
 def list_local_backups() -> list[dict]:
@@ -291,6 +437,183 @@ SERVICE_RESTART_SCOPES = ("control", "services", "host")
 # The orchestrator polls a few times a minute; a request still sitting here after this long
 # means nothing is consuming it, not that it is slow.
 _RESTART_PICKUP_SECONDS = 60
+# Egress and Hardware are restarted serially before Control. Even with their full Docker stop
+# timeout, the new Control process should settle this well before the fallback is reached.
+_CONTAINER_RESTART_SECONDS = 180
+
+
+def container_stack_enabled() -> bool:
+    return os.environ.get("MDD_CONTAINER_STACK", "").strip().lower() in {
+        "1", "true", "yes", "on"}
+
+
+def _container_download_routes(selections: list) -> list[dict]:
+    """Turn update network selections into routes the container helper can dial.
+
+    A host install hands the selections to the orchestrator, whose resolve_route() turns
+    "country US" into the local SOCKS listener. Nothing did that in the container
+    deployment: the helper received the bare selection, found no proxy URL in it, and
+    downloaded directly while reporting route "direct" — exactly where an operator had
+    picked a proxy because the direct path to GitHub is unusable. Resolve against the
+    Egress SOCKS status here, and refuse a route that is not ready instead of dropping it
+    to direct. As on the host, `auto` offers several candidates and only those that
+    resolve are kept.
+    """
+    from urllib.parse import quote
+    from . import egress
+    from .egress_contract import current_status, socks_endpoint
+
+    proxy = cfg.get_settings().get("proxy") or {}
+    state = egress.status() or {}
+    live = (state.get("exits") or {}) if current_status(state, proxy, time.time()) else {}
+    exits = proxy.get("exits") or {}
+
+    def exit_url(country: str) -> str:
+        exit_state = live.get(country)
+        if (not (exits.get(country) or {}).get("enabled") or not isinstance(exit_state, dict)
+                or exit_state.get("ready") is not True
+                or exit_state.get("transport") != "socks5"):
+            return ""
+        try:
+            # socks5h: GitHub's hostname is resolved by the exit, not by this NAS.
+            return "socks5h://" + socks_endpoint(exit_state).split("://", 1)[1]
+        except ValueError:
+            return ""
+
+    routes, errors = [], []
+    for selection in selections:
+        if not isinstance(selection, dict):
+            continue
+        mode = str(selection.get("proxy_mode") or "direct").strip().lower()
+        if mode == "direct":
+            routes.append({"proxy_url": "", "route": "direct", "route_name": ""})
+        elif mode == "country":
+            country = str(selection.get("proxy_country") or "").strip().lower()
+            url = exit_url(country) if re.fullmatch(r"[a-z]{2}", country) else ""
+            if url:
+                routes.append({"proxy_url": url, "route": "country",
+                               "route_name": country.upper()})
+            else:
+                errors.append(f"update country exit {country.upper() or '?'} is not ready")
+        elif mode == "library":
+            profile_id = str(selection.get("proxy_profile_id") or "").strip()
+            profile = (proxy.get("profiles") or {}).get(profile_id)
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", profile_id) \
+                    or not isinstance(profile, dict):
+                errors.append("selected update proxy is not in the proxy library")
+                continue
+            name = str(profile.get("name") or profile_id).strip()[:120]
+            if profile.get("type") == "socks5":
+                host = str(profile.get("server") or "").strip()
+                try:
+                    port = int(profile.get("port") or 1080)
+                except (TypeError, ValueError):
+                    port = 0
+                if not host or not 1 <= port <= 65535 or any(ch in host for ch in "\r\n/@"):
+                    errors.append("selected SOCKS5 update proxy is invalid")
+                    continue
+                user = quote(str(profile.get("username") or ""), safe="")
+                password = quote(str(profile.get("password") or ""), safe="")
+                auth = f"{user}:{password}@" if user or password else ""
+                url = f"socks5h://{auth}{host}:{port}"
+            else:
+                url = next((exit_url(country) for country, exit_cfg in exits.items()
+                            if isinstance(exit_cfg, dict)
+                            and exit_cfg.get("profile_id") == profile_id
+                            and exit_url(country)), "")
+                if not url:
+                    errors.append("selected update proxy has no ready country exit")
+                    continue
+            routes.append({"proxy_url": url, "route": "library", "route_name": name})
+        else:
+            errors.append("invalid update proxy mode")
+    if not routes:
+        raise ValueError(errors[-1] if errors else "no usable update download route")
+    return routes
+
+
+def launch_container_update() -> dict:
+    """Consume the WebUI update request in a detached sibling of the current Control image."""
+    root = Path(cfg.DATA_DIR)
+    request_path = root / "orchestrator" / "update-request.json"
+    status_path = root / "orchestrator" / "update-status.json"
+    request = _read_json(request_path)
+    version = str(request.get("version") or "")
+    repository = str(request.get("repository") or "")
+    if not re.fullmatch(r"\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?", version) \
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        result = {"state": "failed", "phase": "launch",
+                  "error": "invalid container update request", "updated_at": int(time.time())}
+        _write_private_json(status_path, result)
+        request_path.unlink(missing_ok=True)
+        return {"ok": False, **result}
+    host_data = os.environ.get("MDD_HOST_DATA", "").strip()
+    if not host_data.startswith("/") or ":" in host_data:
+        result = {"state": "failed", "phase": "launch",
+                  "error": "MDD_HOST_DATA must be an absolute host path",
+                  "updated_at": int(time.time())}
+        _write_private_json(status_path, result)
+        request_path.unlink(missing_ok=True)
+        return {"ok": False, **result}
+    network_path = root / "update" / "network.json"
+    selections = request.get("networks")
+    if not isinstance(selections, list) or not selections:
+        selections = [request.get("network") or {}]
+    try:
+        routes = _container_download_routes(selections)
+    except ValueError as exc:
+        result = {"state": "failed", "phase": "launch", "error": str(exc)[:400],
+                  "target": version, "updated_at": int(time.time())}
+        _write_private_json(status_path, result)
+        request_path.unlink(missing_ok=True)
+        return {"ok": False, **result}
+    _write_private_json(network_path, {"routes": routes,
+                                       "asset_sizes": request.get("asset_sizes") or {}})
+
+    client = None
+    try:
+        client = docker.from_env()
+        control_name = os.environ.get("MDD_CONTROL_CONTAINER", "mdd-sim-gateway-control")
+        control = client.containers.get(control_name)
+        labels = (control.attrs.get("Config") or {}).get("Labels") or {}
+        if labels.get("io.mdd-sim-gateway.managed") != "true" \
+                or labels.get("io.mdd-sim-gateway.component") != "control":
+            raise RuntimeError("refusing to launch an updater from an unowned Control container")
+        command = ["/app/host/mdd_container_update.py", "--data", "/data",
+                   "--version", version, "--repository", repository,
+                   "--network-config", "/data/update/network.json"]
+        helper = client.containers.create(
+            control.image.id, command=command, entrypoint=["python"], detach=True,
+            auto_remove=True, healthcheck={"test": ["NONE"]},
+            # The data directory also appears at its own host path, so Compose can be run
+            # from there and label the containers the way Container Manager does (see
+            # mdd_container_update.compose_location).
+            volumes=[f"{host_data}:/data:rw", f"{host_data}:{host_data}:rw",
+                     "/var/run/docker.sock:/var/run/docker.sock:rw"],
+            environment={"MDD_DATA": "/data", "MDD_HOST_DATA": host_data,
+                         "PYTHONDONTWRITEBYTECODE": "1"},
+            labels={"io.mdd-sim-gateway.managed": "true",
+                    "io.mdd-sim-gateway.component": "update-helper"},
+            name=f"mdd-sim-gateway-update-{time.time_ns()}",
+            network=os.environ.get("MDD_ENGINE_DIRECT_NETWORK", "mdd-sim-gateway-uplink"))
+        engine_network = client.networks.get(
+            os.environ.get("MDD_ENGINE_NETWORK", "mdd-sim-gateway-engine"))
+        engine_network.connect(helper)
+        helper.start()
+        request_path.unlink(missing_ok=True)
+        return {"ok": True, "version": version, "executor": "container"}
+    except Exception as exc:  # noqa: Docker backends expose several exception classes
+        result = {"state": "failed", "phase": "launch", "error": str(exc)[:1000],
+                  "updated_at": int(time.time())}
+        _write_private_json(status_path, result)
+        request_path.unlink(missing_ok=True)
+        return {"ok": False, **result}
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa
+                pass
 
 
 def _service_restart_paths() -> tuple[Path, Path]:
@@ -315,15 +638,18 @@ def _read_json(path: Path) -> dict:
 
 
 def request_service_restart(scope: str) -> dict:
-    """Publish a service-restart request for the root orchestrator to carry out.
+    """Publish a service-restart request for the active deployment executor to carry out.
 
-    The control plane can restart neither itself nor the host: it is unprivileged, and in two
-    of the three scopes it is one of the processes being restarted. So it only states the
-    intent, exactly as it does for self-updates, and the orchestrator detaches whatever would
-    otherwise kill the process running it.
+    The request file keeps the API contract identical between the Pi host orchestrator and the
+    container executor. Both detach the operation that eventually stops this process.
     """
     if scope not in SERVICE_RESTART_SCOPES:
         return {"ok": False, "error_code": "restart.error.invalid_scope"}
+    # A container may restart the project containers through the already-mounted Docker
+    # socket, but rebooting the NAS remains a host administration action. Do not emulate it
+    # with a privileged helper container or a host namespace escape.
+    if scope == "host" and container_stack_enabled():
+        return {"ok": False, "error_code": "restart.error.host_unavailable"}
     request_path, status_path = _service_restart_paths()
     now = int(time.time())
     # Reset the visible status first so the previous restart's outcome cannot be read as this
@@ -331,6 +657,99 @@ def request_service_restart(scope: str) -> dict:
     _write_private_json(status_path, {"state": "requested", "scope": scope, "updated_at": now})
     _write_private_json(request_path, {"scope": scope, "requested_at": now})
     return {"ok": True, "scope": scope}
+
+
+def perform_container_service_restart(scope: str, client=None) -> dict:
+    """Consume a restart request and restart only named, ownership-checked MDD containers."""
+    request_path, status_path = _service_restart_paths()
+    request = _read_json(request_path)
+    if str(request.get("scope") or "") != scope or scope not in {"control", "services"}:
+        result = {"state": "failed", "scope": scope,
+                  "error_code": "restart.error.invalid_scope", "updated_at": int(time.time())}
+        _write_private_json(status_path, result)
+        return result
+    try:
+        request_path.unlink()
+    except OSError:
+        pass
+    running = {"state": "running", "scope": scope, "executor": "container",
+               "updated_at": int(time.time())}
+    _write_private_json(status_path, running)
+    own_client = client is None
+    docker_client = client
+    names = {
+        "control": os.environ.get("MDD_CONTROL_CONTAINER", "mdd-sim-gateway-control"),
+        "hardware": os.environ.get("MDD_HARDWARE_CONTAINER", "mdd-sim-gateway-hardware"),
+        "egress": os.environ.get("MDD_EGRESS_CONTAINER", "mdd-sim-gateway-egress"),
+    }
+    order = ["control"] if scope == "control" else ["egress", "hardware", "control"]
+    try:
+        if docker_client is None:
+            docker_client = docker.from_env()
+        containers = []
+        for component in order:
+            container = docker_client.containers.get(names[component])
+            labels = (container.attrs.get("Config") or {}).get("Labels") or {}
+            if (labels.get("io.mdd-sim-gateway.managed") != "true"
+                    or labels.get("io.mdd-sim-gateway.component") != component):
+                raise RuntimeError(f"refusing to restart unowned {component} container")
+            containers.append((component, container))
+        control_container = next(container for component, container in containers
+                                 if component == "control")
+        for component, container in containers:
+            if component == "control":
+                continue
+            if component == "hardware":
+                marker = Path(cfg.DATA_DIR) / "orchestrator" / "pcsc-maintenance"
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(str(int(time.time())), encoding="ascii")
+            container.restart(timeout=30)
+        # Docker cancels a synchronous restart when its caller lives in the target container:
+        # the daemon stops Control (and therefore the HTTP client driving the request) before
+        # it reaches the start half. A short-lived sibling performs the final restart instead.
+        target_name = json.dumps(names["control"])
+        helper = (
+            "import time,docker\n"
+            "time.sleep(1)\n"
+            "client=docker.from_env()\n"
+            f"target=client.containers.get({target_name})\n"
+            "labels=(target.attrs.get('Config') or {}).get('Labels') or {}\n"
+            "assert labels.get('io.mdd-sim-gateway.managed') == 'true'\n"
+            "assert labels.get('io.mdd-sim-gateway.component') == 'control'\n"
+            "target.restart(timeout=30)\n")
+        docker_client.containers.run(
+            # docker-py shell-splits a string command before sending it to the daemon.
+            # Keep the complete Python program as the one argument consumed by ``-c``.
+            control_container.image.id, command=[helper], entrypoint=["python", "-c"],
+            detach=True, auto_remove=True, network_mode="none",
+            healthcheck={"test": ["NONE"]},
+            volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
+            labels={"io.mdd-sim-gateway.managed": "true",
+                    "io.mdd-sim-gateway.component": "restart-helper"},
+            name=f"mdd-sim-gateway-restart-{time.time_ns()}")
+        return running
+    except Exception as exc:  # noqa: Docker exposes several backend-specific exception types
+        result = {**running, "state": "failed", "error_code": "restart.error.failed",
+                  "error": str(exc)[:400], "updated_at": int(time.time())}
+        _write_private_json(status_path, result)
+        return result
+    finally:
+        if own_client and docker_client is not None:
+            try:
+                docker_client.close()
+            except Exception:  # noqa
+                pass
+
+
+def settle_container_service_restart() -> dict:
+    """This Control process coming back proves its container restart completed."""
+    _request_path, status_path = _service_restart_paths()
+    status = _read_json(status_path)
+    if (status.get("state") == "running" and status.get("executor") == "container"
+            and status.get("scope") in {"control", "services"}):
+        status = {**status, "state": "success", "updated_at": int(time.time())}
+        _write_private_json(status_path, status)
+    return status
 
 
 def service_restart_status() -> dict:
@@ -348,6 +767,12 @@ def service_restart_status() -> dict:
         if time.time() - requested_at > _RESTART_PICKUP_SECONDS:
             status["state"] = "stalled"
             status["error_code"] = "restart.error.not_picked_up"
+    elif (status.get("state") == "running" and status.get("executor") == "container"
+          and time.time() - int(status.get("updated_at") or 0) > _CONTAINER_RESTART_SECONDS):
+        # A detached helper that failed before stopping Control cannot report through its
+        # caller. Bound that otherwise-infinite running state for the still-live API.
+        status["state"] = "failed"
+        status["error_code"] = "restart.error.failed"
     return status
 
 
@@ -371,48 +796,174 @@ def host_diagnostics() -> dict:
 
 def support_bundle(status_documents: dict, log_lines: int = 500) -> bytes:
     log_lines = max(50, min(2000, int(log_lines)))
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        settings = redact(cfg.get_settings())
-        archive.writestr("settings-redacted.yaml", yaml.safe_dump(settings, allow_unicode=True))
-        archive.writestr("status-redacted.json", json.dumps(
-            redact(status_documents), ensure_ascii=False, indent=2))
-        # The host orchestrator owns systemd, the USB tree and the bridge children; this
-        # process runs in a container that can observe none of them. Without its published
-        # view a modem fault is only diagnosable by asking the operator to run commands.
-        archive.writestr("host-diagnostics-redacted.json", json.dumps(
-            redact(host_diagnostics()), ensure_ascii=False, indent=2))
-        base = Path(cfg.DATA_DIR) / "instances"
-        # Include the current logs, compact rebuild snapshots and retained IKE segments. Every
-        # source goes through the same redaction and contributes only its configured tail.
-        # These globs are an allow-list on purpose. logs/voicemail/*.wav lives under the same
-        # directory and must NEVER be collected: a bundle is meant to be shareable, and a
-        # recording of a caller's voice cannot be redacted into something safe to share.
-        paths = [*base.glob("*/run/*.log"), *base.glob("*/logs/diagnostics.jsonl"),
-                 *base.glob("*/logs/ike/charon-*.log")]
-        # The engine's call events are the only record of the Q.850 cause behind a service
-        # code's verdict, so a bundle without them cannot answer "was it really unsupported?".
-        # They are filtered rather than redacted; see call_event_evidence.
-        for path in sorted(base.glob("*/logs/events.jsonl")):
+    settings = yaml.safe_dump(redact(cfg.get_settings()), allow_unicode=True)
+    status = json.dumps(redact(status_documents), ensure_ascii=False, indent=2)
+    # The host orchestrator owns systemd, the USB tree and the bridge children; this process
+    # can observe none of them. Every value still passes through the same redactor.
+    host = json.dumps(redact(host_diagnostics()), ensure_ascii=False, indent=2)
+    fixed = {
+        "settings-redacted.yaml": settings,
+        "status-redacted.json": status,
+        "host-diagnostics-redacted.json": host,
+    }
+    base = Path(cfg.DATA_DIR) / "instances"
+    candidates: list[dict] = []
+
+    def jsonl_times(lines: list[str]) -> tuple[int | None, int | None]:
+        values = []
+        for line in lines:
             try:
-                lines = path.read_text(errors="replace").splitlines()[-(log_lines * 4):]
-            except OSError:
+                value = int((json.loads(line) or {}).get("ts") or 0)
+            except (ValueError, TypeError, AttributeError):
                 continue
-            evidence = call_event_evidence("\n".join(lines))
-            if evidence:
-                archive.writestr(f"logs/{path.parent.parent.name}-call-events.jsonl", evidence)
-        for path in sorted(paths):
-            try:
-                lines = path.read_text(errors="replace").splitlines()[-log_lines:]
-            except OSError:
-                continue
-            joined = "\n".join(lines)
+            if value:
+                values.append(value)
+        return (min(values), max(values)) if values else (None, None)
+
+    def add_candidate(path: Path, name: str, source: list[str], eligible: list[str],
+                      selected: list[str], text: str, priority: int,
+                      raw_line_count: int | None = None) -> None:
+        archived = text.splitlines()
+        first_ts, last_ts = jsonl_times(archived) if path.suffix == ".jsonl" else (None, None)
+        stat = path.stat()
+        raw_lines = len(source) if raw_line_count is None else raw_line_count
+        coverage = {
+            "raw_lines": raw_lines,
+            "scanned_lines": len(source),
+            "unscanned_lines": max(0, raw_lines - len(source)),
+            "eligible_lines": len(eligible),
+            "filtered_lines": max(0, len(source) - len(eligible)),
+            "included_lines": len(archived),
+            "truncated": raw_lines > len(source) or len(selected) < len(eligible),
+            "mtime": int(stat.st_mtime),
+        }
+        if first_ts is not None:
+            coverage.update({"first_ts": first_ts, "last_ts": last_ts})
+        candidates.append({"name": name, "text": text, "priority": priority,
+                           "coverage": coverage})
+
+    # Events are filtered rather than generically exported: subscriber calls and message
+    # bodies never enter the candidate set at all.
+    for path in sorted(base.glob("*/logs/events.jsonl")):
+        try:
+            tail: deque[str] = deque(maxlen=CALL_EVENT_SCAN_LINES)
+            raw_line_count = 0
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    raw_line_count += 1
+                    tail.append(line.rstrip("\r\n"))
+            source = list(tail)
+            eligible = call_event_evidence("\n".join(source)).splitlines()
+            selected = eligible[-log_lines:]
+            if selected:
+                evidence = "\n".join(selected)
+                add_candidate(path, f"logs/{path.parent.parent.name}-call-events.jsonl",
+                              source, eligible, selected, evidence, 20, raw_line_count)
+        except OSError:
+            continue
+
+    # Asterisk's `messages` is filtered the way events are, never exported whole (see
+    # asterisk_problem_lines); `full` stays out entirely.
+    for path in sorted(base.glob("*/logs/asterisk/messages")):
+        try:
+            tail = deque(maxlen=CALL_EVENT_SCAN_LINES)
+            raw_line_count = 0
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    raw_line_count += 1
+                    tail.append(line.rstrip("\r\n"))
+            source = list(tail)
+            eligible = asterisk_problem_lines("\n".join(source)).splitlines()
+            selected = eligible[-log_lines:]
+            if selected:
+                add_candidate(path, f"logs/{path.parents[2].name}-asterisk-problems.log",
+                              source, eligible, selected, "\n".join(selected), 30,
+                              raw_line_count)
+        except OSError:
+            continue
+
+    # Explicit allow-list: voicemail recordings and every unknown future file stay excluded.
+    # Note this deliberately does NOT include the rest of /logs/asterisk: Asterisk's own `full`
+    # and `messages` carry the subscriber's IMS public identity on every registration. Only
+    # supervisor.jsonl is admitted whole, and it is a closed schema of exit codes and
+    # durations; `messages` reaches the bundle only through the filter above.
+    paths = [*base.glob("*/run/*.log"), *base.glob("*/logs/diagnostics.jsonl"),
+             *base.glob("*/logs/lifecycle.jsonl"),
+             *base.glob("*/logs/asterisk/supervisor.jsonl"),
+             *base.glob("*/logs/ike/charon-*.log")]
+    for path in sorted(paths):
+        try:
+            source = path.read_text(errors="replace").splitlines()
+            if path.parent.name == "ike" and len(source) > log_lines:
+                head = max(1, log_lines // 5)
+                selected = source[:head] + source[-(log_lines - head):]
+            else:
+                selected = source[-log_lines:]
+            joined = "\n".join(selected)
             text = redact_jsonl(joined) if path.suffix == ".jsonl" else redact_log(joined)
-            iid = path.parents[2].name if path.parent.name == "ike" else path.parent.parent.name
-            archive.writestr(f"logs/{iid}-{path.name}", text)
-        archive.writestr("manifest.json", json.dumps({
+            iid = path.parents[2].name if path.parent.name in ("ike", "asterisk") \
+                else path.parent.parent.name
+            priority = 50 if path.name in ("lifecycle.jsonl", "supervisor.jsonl") else 40 \
+                if path.name == "diagnostics.jsonl" else 10
+            add_candidate(path, f"logs/{iid}-{path.name}", source, source, selected,
+                          text, priority)
+        except OSError:
+            continue
+
+    def mark_omitted(coverage: dict) -> None:
+        coverage.update({"included_lines": 0, "included_bytes": 0, "omitted": True})
+
+    files = {}
+    included = dict(fixed)
+    used = sum(len(value.encode("utf-8")) for value in fixed.values())
+    for candidate in sorted(candidates, key=lambda item: (-item["priority"], item["name"])):
+        encoded = candidate["text"].encode("utf-8")
+        coverage = {**candidate["coverage"], "included_bytes": len(encoded)}
+        if used + len(encoded) <= SUPPORT_BUNDLE_CONTENT_BYTES:
+            included[candidate["name"]] = candidate["text"]
+            used += len(encoded)
+            coverage["omitted"] = False
+        else:
+            mark_omitted(coverage)
+        files[candidate["name"]] = coverage
+
+    def build() -> bytes:
+        manifest = {
             "created_at": int(time.time()), "redacted": True,
             "contains_credentials": False, "review_before_sharing": True,
             "log_lines_per_file": log_lines,
-        }, indent=2))
-    return output.getvalue()
+            "max_archive_bytes": SUPPORT_BUNDLE_MAX_BYTES,
+            "files": files,
+        }
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, text in included.items():
+                archive.writestr(name, text)
+            archive.writestr("manifest.json", json.dumps(manifest, indent=2))
+        return output.getvalue()
+
+    content = build()
+    # Compression normally makes the 8 MiB raw budget much smaller. If an unusually
+    # incompressible bundle exceeds the public upload contract, inspect the already-built ZIP
+    # once, choose enough low-priority entries to cover the exact compressed deficit, then
+    # rebuild a single time. Recompressing the whole archive after every removed file was
+    # quadratic on a Raspberry Pi.
+    removable = sorted(
+        (item for item in candidates if item["name"] in included),
+        key=lambda item: (item["priority"], item["name"]))
+    if len(content) > SUPPORT_BUNDLE_MAX_BYTES and removable:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            compressed = {info.filename: info.compress_size + 76 + 2 * len(info.filename)
+                          for info in archive.infolist()}
+        deficit = len(content) - SUPPORT_BUNDLE_MAX_BYTES + 1024
+        reclaimed = 0
+        for item in removable:
+            included.pop(item["name"], None)
+            mark_omitted(files[item["name"]])
+            reclaimed += compressed.get(item["name"], 0)
+            if reclaimed >= deficit:
+                break
+        content = build()
+    if len(content) > SUPPORT_BUNDLE_MAX_BYTES:
+        raise RuntimeError("redacted support bundle exceeds its 10 MiB safety budget")
+    return content

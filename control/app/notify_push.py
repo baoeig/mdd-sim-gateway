@@ -1,10 +1,11 @@
 """
 notify_push.py - Outbound push notifications for incoming events (SMS / calls).
 
-Three independent, separately-configurable channels, all driven from global settings:
+Four independent, separately-configurable channels, all driven from global settings:
   - webhook : GET or POST standard/custom fields to a user-supplied URL.
   - telegram: send a formatted message to a chat/channel via a Telegram bot.
   - pushplus: send through the official PushPlus HTTP API.
+  - feishu  : send text notifications through a Feishu/Lark custom bot webhook.
 
 Both fire on the SAME internal events (incoming_sms, incoming_call) and carry the same
 core fields (SIM ICCID, the line's own MSISDN, the event's source number, the event type,
@@ -15,6 +16,9 @@ failing/slow endpoint only logs a warning.
 from __future__ import annotations
 
 import collections
+import base64
+import hashlib
+import hmac
 import logging
 import json
 import os
@@ -22,7 +26,10 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -53,6 +60,11 @@ EV_NUMBER_CHANGED = "number_changed"
 # could carry a tunnel, or the failures were never the exit's fault to begin with. Both need
 # a person, and a gateway that cannot recover should say so rather than rebuild forever.
 EV_LINE_UNRECOVERABLE = "line_unrecoverable"
+# A line has stayed off the network past the user's threshold, for whatever reason — including
+# ones the gateway is still busy retrying. The all-clear is its own event so a webhook can
+# tell the two apart and a user can keep one without the other.
+EV_LINE_OFFLINE = "line_offline"
+EV_LINE_RECOVERED = "line_recovered"
 # The scheduled number-keeping action ran. Both outcomes are announced, not just failures:
 # the successful case spent the user's money on their SIM, and that deserves a receipt.
 EV_KEEPALIVE_RESULT = "keepalive_result"
@@ -72,6 +84,7 @@ EV_VOICEMAIL = "voicemail_received"
 EV_SOFTWARE_UPDATE = "software_update"
 
 _TIMEOUT = 8  # seconds; keep short so a dead endpoint never piles up threads
+_DELIVERY_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="mdd-notify")
 _TOKEN = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 _HISTORY_LOCK = threading.RLock()
 _PENDING: dict[str, dict] = {}
@@ -161,6 +174,8 @@ def _events_enabled(chan: dict) -> dict:
         EV_HOST_ALERT: ev.get(EV_HOST_ALERT, True),
         EV_NUMBER_CHANGED: ev.get(EV_NUMBER_CHANGED, True),
         EV_LINE_UNRECOVERABLE: ev.get(EV_LINE_UNRECOVERABLE, True),
+        EV_LINE_OFFLINE: ev.get(EV_LINE_OFFLINE, True),
+        EV_LINE_RECOVERED: ev.get(EV_LINE_RECOVERED, True),
         EV_KEEPALIVE_RESULT: ev.get(EV_KEEPALIVE_RESULT, True),
         EV_BALANCE_LOW: ev.get(EV_BALANCE_LOW, True),
         EV_MISSED_CALL: ev.get(EV_MISSED_CALL, True),
@@ -170,9 +185,58 @@ def _events_enabled(chan: dict) -> dict:
 
 
 def has_enabled_channel(settings: dict, event: str) -> bool:
-    return any(bool((settings.get(key) or {}).get("enabled"))
+    standard = any(bool((settings.get(key) or {}).get("enabled"))
                and bool(_events_enabled(settings.get(key) or {}).get(event))
                for key in ("webhook", "telegram", "pushplus"))
+    return standard or any(
+        bool(channel.get("enabled")) and bool(_events_enabled(channel).get(event))
+        for channel in feishu_channels(settings.get("feishu") or {})
+    )
+
+
+def feishu_channels(cfg: dict) -> list[dict]:
+    """Normalized Feishu destinations, including one legacy single-bot destination.
+
+    An explicit ``channels`` list owns delivery as soon as it is non-empty. This prevents the
+    legacy top-level URL from causing duplicate fan-out after the first multi-channel save.
+    """
+    channels = cfg.get("channels")
+    if isinstance(channels, list):
+        return [dict(channel) for channel in channels if isinstance(channel, dict)]
+    if cfg.get("url") or cfg.get("enabled"):
+        legacy = dict(cfg)
+        legacy.pop("channels", None)
+        legacy.setdefault("id", "legacy")
+        legacy.setdefault("name", "Feishu / Lark")
+        legacy.setdefault("instances", [])
+        return [legacy]
+    return []
+
+
+def feishu_channel_matches(channel: dict, instance_id) -> bool:
+    selected = {str(value) for value in (channel.get("instances") or []) if str(value).strip()}
+    return not selected or str(instance_id or "") in selected
+
+
+def validate_feishu_channels(cfg: dict) -> list[dict]:
+    channels = feishu_channels(cfg)
+    seen = set()
+    for position, channel in enumerate(channels, start=1):
+        channel_id = str(channel.get("id") or position)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", channel_id) or channel_id in seen:
+            raise ValueError("Feishu channel IDs must be unique and use letters, digits, ., _ or -")
+        seen.add(channel_id)
+        if len(str(channel.get("name") or "")) > 120 \
+                or any(char in str(channel.get("name") or "") for char in "\r\n"):
+            raise ValueError("Feishu channel name is invalid")
+        instances = channel.get("instances") or []
+        if not isinstance(instances, list) or any(
+                not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", str(value)) for value in instances):
+            raise ValueError("Feishu instance filters are invalid")
+        validate_message_templates(channel)
+        if channel.get("enabled"):
+            validate_feishu_url(channel.get("url"))
+    return channels
 
 
 def build_payload(event: str, instance: dict, source: str, text: str | None) -> dict:
@@ -187,7 +251,8 @@ def build_payload(event: str, instance: dict, source: str, text: str | None) -> 
         "msisdn": instance.get("msisdn", "") or "",       # the line's own number (may be "")
         "from": source or "",                             # the event's source number
         "text": text if event in (EV_INCOMING_SMS, EV_HOST_ALERT, EV_NUMBER_CHANGED,
-                                  EV_LINE_UNRECOVERABLE, EV_KEEPALIVE_RESULT,
+                                  EV_LINE_UNRECOVERABLE, EV_LINE_OFFLINE,
+                                  EV_LINE_RECOVERED, EV_KEEPALIVE_RESULT,
                                   EV_BALANCE_LOW, EV_VOICEMAIL,
                                   EV_SOFTWARE_UPDATE) else None,
     }
@@ -205,7 +270,7 @@ def _titled(text: str) -> str:
     return text if text.startswith(BRAND) else f"{BRAND} · {text}"
 
 
-def build_notification_message(payload: dict) -> dict:
+def _default_notification_message(payload: dict) -> dict:
     """Build the human-readable title/content shared by templates and vendor channels."""
     event = payload.get("event")
     sim = payload.get("sim_name") or payload.get("iccid") or payload.get("instance") or "SIM"
@@ -219,6 +284,10 @@ def build_notification_message(payload: dict) -> dict:
         return {"title": _titled(f"线路号码已变更 · {sim}"), "content": payload.get("text") or ""}
     if event == EV_LINE_UNRECOVERABLE:
         return {"title": _titled(f"线路无法自动恢复 · {sim}"), "content": payload.get("text") or ""}
+    if event == EV_LINE_OFFLINE:
+        return {"title": _titled(f"线路离线 · {sim}"), "content": payload.get("text") or ""}
+    if event == EV_LINE_RECOVERED:
+        return {"title": _titled(f"线路已恢复 · {sim}"), "content": payload.get("text") or ""}
     if event == EV_KEEPALIVE_RESULT:
         return {"title": _titled(f"保号执行结果 · {sim}"), "content": payload.get("text") or ""}
     if event == EV_BALANCE_LOW:
@@ -248,7 +317,7 @@ def build_notification_message(payload: dict) -> dict:
 
 
 def _template_context(cfg: dict, payload: dict) -> dict:
-    return {**payload, **build_notification_message(payload)}
+    return {**payload, **build_notification_message(payload, cfg)}
 
 
 def _render(value, context: dict):
@@ -263,6 +332,79 @@ def _render(value, context: dict):
     if exact:
         return context.get(exact.group(1))
     return _TOKEN.sub(lambda m: str(context.get(m.group(1)) or ""), value)
+
+
+_MESSAGE_TEMPLATE_FIELDS = {
+    "event", "instance", "sim_name", "iccid", "msisdn", "from", "text",
+    "title", "content",
+}
+_MAX_MESSAGE_TEMPLATE_LENGTH = 4000
+NOTIFICATION_EVENTS = {
+    EV_INCOMING_SMS, EV_INCOMING_CALL, EV_HOST_ALERT, EV_NUMBER_CHANGED,
+    EV_LINE_UNRECOVERABLE, EV_LINE_OFFLINE, EV_LINE_RECOVERED, EV_KEEPALIVE_RESULT,
+    EV_BALANCE_LOW, EV_MISSED_CALL, EV_VOICEMAIL, EV_SOFTWARE_UPDATE,
+}
+
+
+def _event_message_template(cfg: dict, event: str) -> dict:
+    if not isinstance(cfg, dict):
+        raise ValueError("notification channel configuration must be an object")
+    templates = cfg.get("message_templates") or {}
+    if not isinstance(templates, dict):
+        raise ValueError("notification message templates must be an object")
+    value = templates.get(event) or {}
+    if not isinstance(value, dict):
+        raise ValueError("notification event template must be an object")
+    return value
+
+
+def _validate_message_template(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("notification message template must be text")
+    text = value
+    if len(text) > _MAX_MESSAGE_TEMPLATE_LENGTH:
+        raise ValueError("notification message template is too long")
+    unknown = sorted(set(_TOKEN.findall(text)) - _MESSAGE_TEMPLATE_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown notification template field: {unknown[0]}")
+    return text
+
+
+def validate_message_templates(cfg: dict) -> None:
+    if not isinstance(cfg, dict):
+        raise ValueError("notification channel configuration must be an object")
+    templates = cfg.get("message_templates") or {}
+    if not isinstance(templates, dict):
+        raise ValueError("notification message templates must be an object")
+    for event, template in templates.items():
+        if event not in NOTIFICATION_EVENTS:
+            raise ValueError(f"unknown notification template event: {event}")
+        if not isinstance(template, dict):
+            raise ValueError("notification event template must be an object")
+        unknown = sorted(set(template) - {"title", "content"})
+        if unknown:
+            raise ValueError(f"unknown notification template property: {unknown[0]}")
+        for value in template.values():
+            _validate_message_template(value)
+
+
+def _render_notification_message(payload: dict, cfg: dict, default: dict) -> dict:
+    template = _event_message_template(cfg or {}, str(payload.get("event") or ""))
+    context = {**payload, **default}
+    result = dict(default)
+    for field in ("title", "content"):
+        if field in template and str(template.get(field) or "").strip():
+            result[field] = str(_render(_validate_message_template(template[field]), context))
+    return result
+
+
+def build_notification_message(payload: dict, cfg: dict | None = None) -> dict:
+    """Build the shared message, applying an optional per-event title/content override.
+
+    Templates deliberately support field replacement only. They cannot evaluate expressions,
+    access files or call code, and an unknown field is rejected instead of silently disappearing.
+    """
+    return _render_notification_message(payload, cfg or {}, _default_notification_message(payload))
 
 
 def _json_setting(value, fallback):
@@ -303,7 +445,10 @@ def build_webhook_request(cfg: dict, payload: dict) -> tuple[str, str, dict]:
         else:
             body = _render(_json_setting(raw_template, {}), context)
     else:
-        body = payload
+        # Standard webhooks carry both canonical machine fields and the same rendered title and
+        # content used by vendor channels. Existing receivers keep every original field, while a
+        # receiver that wants human-readable text no longer has to recreate event wording.
+        body = {**payload, **build_notification_message(payload, cfg)}
 
     kwargs = {"headers": headers, "timeout": _TIMEOUT,
               "verify": bool(cfg.get("verify_tls", True))}
@@ -352,7 +497,7 @@ def send_pushplus(cfg: dict, payload: dict) -> dict:
     channel = str(cfg.get("channel") or "wechat").strip().lower()
     if channel not in {"wechat", "webhook", "cp", "mail", "sms", "voice", "extension", "app", "clawbot"}:
         raise ValueError("unsupported PushPlus channel")
-    message = build_notification_message(payload)
+    message = build_notification_message(payload, cfg)
     body = {"token": token, **message, "template": template, "channel": channel}
     topic = str(cfg.get("topic") or "").strip()
     if topic:
@@ -369,6 +514,73 @@ def send_pushplus(cfg: dict, payload: dict) -> dict:
     return {"ok": True, "status_code": response.status_code}
 
 
+def feishu_signature(timestamp: int | str, secret: str) -> str:
+    """Return the signature required by Feishu/Lark custom bots.
+
+    The platform defines the HMAC key as ``<timestamp>\n<secret>`` and signs an empty
+    message. Keeping this in a small pure function makes the slightly unusual contract
+    explicit and gives callers a deterministic unit-test target.
+    """
+    key = f"{timestamp}\n{secret}".encode("utf-8")
+    digest = hmac.new(key, b"", digestmod=hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _feishu_text(payload: dict, cfg: dict | None = None) -> str:
+    message = build_notification_message(payload, cfg or {})
+    return "\n\n".join(part for part in (message["title"], message["content"]) if part)
+
+
+def validate_feishu_url(url: str) -> str:
+    value = str(url or "").strip()
+    if not value:
+        raise ValueError("Feishu webhook URL is required")
+    if not re.fullmatch(
+            r"https://(?:open\.feishu\.cn|open\.larksuite\.com)/open-apis/bot/v2/hook/[^/?#]+",
+            value, re.IGNORECASE):
+        raise ValueError("Feishu webhook URL is invalid")
+    return value
+
+
+def send_feishu(cfg: dict, payload: dict) -> dict:
+    """Send one Feishu/Lark custom-bot text message and validate its JSON result.
+
+    Feishu commonly returns HTTP 200 even when it rejects a payload, so transport success
+    alone is insufficient. Both Feishu's ``code`` response and Lark-compatible
+    ``StatusCode``/``status`` variants are accepted only when they explicitly report success.
+    """
+    url = validate_feishu_url(cfg.get("url"))
+    body: dict[str, Any] = {
+        "msg_type": "text",
+        "content": {"text": _feishu_text(payload, cfg)},
+    }
+    secret = str(cfg.get("secret") or "").strip()
+    if secret:
+        timestamp = int(time.time())
+        body.update({"timestamp": str(timestamp), "sign": feishu_signature(timestamp, secret)})
+    try:
+        response = requests.post(url, json=body, timeout=_TIMEOUT)
+        response.raise_for_status()
+        result = response.json()
+    except requests.RequestException:
+        # Never include the exception: its URL contains the bot token.
+        raise RuntimeError("Feishu request failed") from None
+    except ValueError:
+        raise RuntimeError("Feishu returned an invalid response") from None
+    if not isinstance(result, dict):
+        raise RuntimeError("Feishu returned an invalid response")
+    success = False
+    if "code" in result:
+        success = str(result.get("code")) == "0"
+    elif "StatusCode" in result:
+        success = str(result.get("StatusCode")) == "0"
+    elif "status" in result:
+        success = str(result.get("status")).lower() in {"ok", "success"}
+    if not success:
+        raise RuntimeError("Feishu rejected the message")
+    return {"ok": True, "status_code": response.status_code}
+
+
 def _telegram_headline(icon: str, text: str) -> str:
     """Telegram's own first line. The icon stays leftmost — it is what makes the event type
     scannable in a chat list — and the brand follows it, for the same reason the titles carry
@@ -377,10 +589,16 @@ def _telegram_headline(icon: str, text: str) -> str:
     return f"{icon} {BRAND} · {text}" if icon else f"{BRAND} · {text}"
 
 
-def _telegram_text(payload: dict) -> str:
+def _default_telegram_text(payload: dict) -> str:
     ev = payload.get("event")
     if ev == EV_LINE_UNRECOVERABLE:
         return "\n".join([_telegram_headline("🛑", f"线路无法自动恢复 · {payload.get('sim_name') or payload.get('instance')}"),
+                           "", payload.get("text") or ""])
+    if ev == EV_LINE_OFFLINE:
+        return "\n".join([_telegram_headline("📴", f"线路离线 · {payload.get('sim_name') or payload.get('instance')}"),
+                           "", payload.get("text") or ""])
+    if ev == EV_LINE_RECOVERED:
+        return "\n".join([_telegram_headline("✅", f"线路已恢复 · {payload.get('sim_name') or payload.get('instance')}"),
                            "", payload.get("text") or ""])
     if ev == EV_NUMBER_CHANGED:
         return "\n".join([_telegram_headline("🔄", f"线路号码已变更 · {payload.get('sim_name') or payload.get('instance')}"),
@@ -421,14 +639,62 @@ def _telegram_text(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def _telegram_text(payload: dict, cfg: dict | None = None) -> str:
+    """Keep Telegram's established layout unless this event has an explicit override."""
+    default_text = _default_telegram_text(payload)
+    if not _event_message_template(cfg or {}, str(payload.get("event") or "")):
+        return default_text
+    title, separator, content = default_text.partition("\n")
+    default = {"title": title, "content": content.lstrip("\n") if separator else ""}
+    message = _render_notification_message(payload, cfg or {}, default)
+    return "\n\n".join(part for part in (message["title"], message["content"]) if part)
+
+
 def telegram_session(cfg: dict) -> requests.Session:
     mode = str(cfg.get("proxy_mode") or "direct").lower()
     session = requests.Session()
     session.trust_env = False
     if mode == "manual":
+        # Kept for configurations saved before the shared proxy library was introduced.
         proxy = str(cfg.get("proxy_url") or "").strip()
         if not re.match(r"^(?:https?|socks5h?)://", proxy, re.IGNORECASE):
             raise ValueError("Telegram proxy must be an HTTP(S) or SOCKS5 URL")
+        session.proxies.update({"http": proxy, "https": proxy})
+    elif mode == "library":
+        from . import config as settings_config
+        settings = settings_config.get_settings()
+        profile_id = str(cfg.get("proxy_profile_id") or "").strip()
+        profile = ((settings.get("proxy") or {}).get("profiles") or {}).get(profile_id) or {}
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", profile_id) or not profile:
+            raise RuntimeError("selected Telegram proxy is no longer in the proxy library")
+        if profile.get("type") == "socks5":
+            host = str(profile.get("server") or "").strip()
+            try:
+                port = int(profile.get("port") or 1080)
+            except (TypeError, ValueError):
+                port = 0
+            if not host or not 1 <= port <= 65535 or any(ch in host for ch in "\r\n/@"):
+                raise RuntimeError("selected Telegram SOCKS5 proxy is invalid")
+            username = str(profile.get("username") or "")
+            password = str(profile.get("password") or "")
+            auth = f"{quote(username, safe='')}:{quote(password, safe='')}@" \
+                if username or password else ""
+            proxy = f"socks5h://{auth}{host}:{port}"
+        else:
+            exits = (settings.get("proxy") or {}).get("exits") or {}
+            live = egress.status().get("exits") or {}
+            state = next((live.get(country) or {} for country, exit_cfg in exits.items()
+                          if isinstance(exit_cfg, dict) and exit_cfg.get("enabled")
+                          and exit_cfg.get("profile_id") == profile_id
+                          and (live.get(country) or {}).get("ready")), {})
+            try:
+                port = int(state.get("proxy_port") or 0)
+            except (TypeError, ValueError):
+                port = 0
+            host = str(state.get("proxy_host") or "").strip()
+            if not host or not 1 <= port <= 65535:
+                raise RuntimeError("selected Telegram proxy has no ready country exit")
+            proxy = f"socks5h://{host}:{port}"
         session.proxies.update({"http": proxy, "https": proxy})
     elif mode == "country":
         country = egress.normalize_country(cfg.get("proxy_country"))
@@ -452,7 +718,7 @@ def telegram_session(cfg: dict) -> requests.Session:
         proxy = f"socks5h://{proxy_host}:{proxy_port}"
         session.proxies.update({"http": proxy, "https": proxy})
     elif mode != "direct":
-        raise ValueError("Telegram proxy mode must be direct, manual or country")
+        raise ValueError("Telegram proxy mode must be direct, library, country or legacy manual")
     return session
 
 
@@ -495,7 +761,7 @@ def send_telegram(cfg: dict, payload: dict) -> dict:
     try:
         response = session.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat, "text": _telegram_text(payload),
+            json={"chat_id": chat, "text": _telegram_text(payload, cfg),
                   "disable_web_page_preview": True},
             timeout=_TIMEOUT)
         response.raise_for_status()
@@ -521,21 +787,38 @@ def _post_telegram(cfg: dict, payload: dict):
         log.warning("telegram delivery failed: %s", type(exc).__name__)
 
 
-def dispatch(settings: dict, event: str, instance: dict, source: str, text: str | None = None):
-    """Fire all configured channels for one event. BLOCKING (does the HTTP itself) — the
-    caller runs this off the event path (e.g. asyncio.to_thread + create_task) so a slow
-    endpoint never stalls engine-event handling. Safe to call unconditionally: each channel
-    is gated on its own enable flag + per-event checkbox."""
+def dispatch(settings: dict, event: str, instance: dict, source: str, text: str | None = None,
+             match_instances: list[str] | None = None):
+    """Queue independent deliveries on the notification pool and return their futures.
+
+    HTTP and retry waits never run on the caller's thread. Each destination is gated on its
+    own enable flag, event selection and line filter. ``match_instances`` is for one message
+    that speaks for several lines: a line-filtered destination receives it when any of them
+    is selected.
+    """
+    futures = []
     try:
         payload = build_payload(event, instance, source, text)
+        deliveries = []
         wh = settings.get("webhook") or {}
         if wh.get("enabled") and _events_enabled(wh).get(event):
-            _deliver_with_retry("webhook", send_webhook, wh, payload)
+            deliveries.append(("webhook", send_webhook, wh))
         tg = settings.get("telegram") or {}
         if tg.get("enabled") and _events_enabled(tg).get(event):
-            _deliver_with_retry("telegram", send_telegram, tg, payload)
+            deliveries.append(("telegram", send_telegram, tg))
         pp = settings.get("pushplus") or {}
         if pp.get("enabled") and _events_enabled(pp).get(event):
-            _deliver_with_retry("pushplus", send_pushplus, pp, payload)
+            deliveries.append(("pushplus", send_pushplus, pp))
+        for position, fs in enumerate(feishu_channels(settings.get("feishu") or {}), start=1):
+            if (fs.get("enabled") and _events_enabled(fs).get(event)
+                    and any(feishu_channel_matches(fs, iid) for iid in
+                            (match_instances or [payload.get("instance")]))):
+                channel_id = str(fs.get("id") or position)
+                delivery_channel = "feishu" if channel_id == "legacy" else f"feishu:{channel_id}"
+                deliveries.append((delivery_channel, send_feishu, fs))
+        for channel, sender, channel_cfg in deliveries:
+            futures.append(_DELIVERY_EXECUTOR.submit(
+                _deliver_with_retry, channel, sender, deepcopy(channel_cfg), deepcopy(payload)))
     except Exception as e:  # noqa
         log.warning("push dispatch error: %r", e)
+    return futures
